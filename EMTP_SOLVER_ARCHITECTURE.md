@@ -8,7 +8,14 @@
 
 | 文件 | 大小 | 说明 |
 |---|---|---|
-| `emtp_solver_v3.py` | 176 KB / 4580 行 | **主求解器**（核心） |
+| `emtp/solver.py` | ~3500 行 | **主求解器**（canonical 实现） |
+| `emtp_solver_v3.py` | ~144 行 | legacy compatibility shim |
+| `emtp/runtime/` | 包 | DynamicDeviceRuntime + ResolveManager |
+| `emtp/results/` | 包 | 结果 helper + ResultStore |
+| `emtp/devices/multiport.py` | ~100 行 | MultiPortDevice 协议 |
+| `emtp/lines/bergeron.py` | ~90 行 | BergeronLineDevice adapter |
+| `emtp/lines/ulm.py` | ~140 行 | ULMLineDevice adapter |
+| `emtp/transformers/umec.py` | ~110 行 | UMECTransformerDevice adapter |
 | `emtp_components_series_rl_only.py` | 4 KB / 129 行 | 基础数据结构（Branch, ElementType, CurrentSource） |
 | `transmission_line_emtp_v2.py` | 10 KB | Bergeron 传输线模型 |
 | `ulm_transmission_line_PARA.py` | 96 KB | ULM 通用线路模型（含并行 batch） |
@@ -516,7 +523,12 @@ step_post_solve_V_I → _record_probes → step_post_solve_history
 
 ### 9.5 传输线和变压器
 
-传输线和变压器暂未迁移到 Device 协议。它们在 `_build_MNA_matrix` 和主循环中保持独立的 stamping/更新路径。这是故意的设计选择——它们使用多端口模型且需要 solver 专用的数据结构（ULM batch、端口节点映射）。
+传输线和变压器目前通过 **MultiPortDevice adapter** 提供了统一协议接口（BergeronLineDevice / ULMLineDevice / UMECTransformerDevice），但在 `_build_MNA_matrix` 和主循环中仍保持独立的 stamping/更新路径。这些 adapter 已验证协议正确性，尚未接入 solver 统一 dispatch——后续 PR 将逐步完成切换。
+
+MultiPortDevice 协议定义了统一的：
+- `stamp_G` / `stamp_rhs` — MNA 装配
+- `update_after_solve` / `update_history` — 求解后更新
+- `check_rebuild_required` — 触发拓扑重建（UMEC 饱和）
 
 ### 9.6 向后兼容
 
@@ -529,15 +541,30 @@ step_post_solve_V_I → _record_probes → step_post_solve_history
 ## 10. 依赖关系
 
 ```
-emtp_solver_v3.py
-  ├── emtp_components_series_rl_only.py  (Branch, ElementType, CurrentSource, LineData)
-  ├── numpy                               (数值计算)
-  ├── scipy.sparse / scipy.sparse.linalg  (稀疏矩阵 + SuperLU)
-  ├── [可选] transmission_line_emtp_v2.py     (Bergeron 线)
-  ├── [可选] ulm_transmission_line_PARA.py     (ULM 通用线 + batch)
-  ├── [可选] umec_transformer.py               (UMEC 变压器)
-  ├── [可选] nonlinear_models_pscad.py          (MOA + LPM)
+emtp/solver.py  (canonical EMTPSolver)
+  ├── emtp/nodes.py                         (NodeBook, NodeIndexer)
+  ├── emtp/types.py                         (Branch, VoltageSource, ...)
+  ├── emtp/stamping.py                      (COOStamper, StampingEngine)
+  ├── emtp/sparse_solver.py                 (SparseLinearSolver, SuperLU)
+  ├── emtp/runtime/__init__.py              (DynamicDeviceRuntime)
+  ├── emtp/runtime/resolve.py               (ResolveManager)
+  ├── emtp/devices/base.py                  (Device Protocol)
+  ├── emtp/devices/multiport.py             (MultiPortDevice Protocol)
+  ├── emtp/devices/{resistor,inductor,...}  (7 个 Device 实现)
+  ├── emtp/results/__init__.py              (结果 helper 函数)
+  ├── emtp/results/store.py                 (ResultStore)
+  ├── emtp/lines/bergeron.py                (BergeronLineDevice adapter)
+  ├── emtp/lines/ulm.py                     (ULMLineDevice adapter)
+  ├── emtp/transformers/umec.py             (UMECTransformerDevice adapter)
+  ├── numpy / scipy.sparse                  (数值计算)
+  ├── [可选] transmission_line_emtp_v2.py   (Bergeron 底层模型)
+  ├── [可选] ulm_transmission_line_PARA.py  (ULM 底层模型 + batch)
+  ├── [可选] umec_transformer.py            (UMEC 底层模型)
+  ├── [可选] nonlinear_models_pscad.py      (MOA + LPM)
   └── [可选] atp_lightning_current_generator_simplified.py  (雷电源)
+
+emtp_solver_v3.py  (144 行 legacy compat shim)
+  └── from emtp.solver import EMTPSolver   → 重导出到旧入口
 ```
 
 ---

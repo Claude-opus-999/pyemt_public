@@ -2,12 +2,15 @@
 
 Bergeron (lossless constant-parameter)::
 
-    from emtp.lines.bergeron import BergeronLine, TransmissionLineFactory
+    from emtp.lines.bergeron import BergeronLine, BergeronLineDevice, TransmissionLineFactory
 
 ULM (frequency-dependent universal line model)::
 
     from emtp.lines.ulm import ULMLine, ULMModel, FitULMData, FitULMReader
 """
+
+from .bergeron import BergeronLineDevice
+from .ulm import ULMLineDevice
 
 try:
     from transmission_line_emtp_v2 import (
@@ -39,6 +42,8 @@ except ImportError:
 
 __all__ = [
     "BergeronLine",
+    "BergeronLineDevice",
+    "ULMLineDevice",
     "TransmissionLineInterface",
     "TransmissionLineFactory",
     "DelayBuffer",

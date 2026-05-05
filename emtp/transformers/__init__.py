@@ -5,10 +5,13 @@ Usage::
     from emtp.transformers.umec import (
         UMECTransformer,
         UMECTransformerData,
+        UMECTransformerDevice,
         WindingType,
         create_umec_transformer_3ph_bank_data,
     )
 """
+
+from .umec import UMECTransformerDevice
 
 try:
     from umec_transformer import (
@@ -26,6 +29,7 @@ except ImportError:
 __all__ = [
     "UMECTransformer",
     "UMECTransformerData",
+    "UMECTransformerDevice",
     "WindingType",
     "create_umec_transformer_3ph_bank",
 ]
