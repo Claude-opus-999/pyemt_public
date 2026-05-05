@@ -170,6 +170,10 @@ from emtp.devices import (                               # noqa: E402, F811
 )
 from emtp.runtime import DynamicDeviceRuntime           # noqa: E402, F811
 from emtp.runtime.resolve import ResolveManager
+from emtp.results.store import ResultStore
+from emtp.lines.bergeron import BergeronLineDevice
+from emtp.lines.ulm import ULMLineDevice
+from emtp.transformers.umec import UMECTransformerDevice
 from emtp.results import (                                # noqa: E402
     scale_probe_values,
     scale_values,
@@ -277,6 +281,8 @@ class EMTPSolver:
         max_result_memory_mb: Optional[float] = None,
         pre_sample_sources: bool = False,
         use_rhs_plan: bool = False,
+        use_multiport_lines: bool = False,
+        use_multiport_transformers: bool = False,
     ):
         """
         Parameters
@@ -321,6 +327,8 @@ class EMTPSolver:
         )
         self.pre_sample_sources = bool(pre_sample_sources)
         self.use_rhs_plan = bool(use_rhs_plan)
+        self.use_multiport_lines = bool(use_multiport_lines)
+        self.use_multiport_transformers = bool(use_multiport_transformers)
         self._rhs_plan: Optional[RHSPlan] = None
         self._rhs_plan_dirty: bool = True
         self._active_mna_solver_name = _SPARSE_SOLVER_NAME
@@ -334,6 +342,7 @@ class EMTPSolver:
         # ---- 元件存储 ----
         self.branches: Dict[str, Branch] = {}
         self._devices: List[Device] = []
+        self._multiport_devices: List[Any] = []
         self.current_sources: Dict[str, CurrentSource] = {}
         self.voltage_sources: Dict[str, VoltageSource] = {}
         self.transmission_lines: Dict[str, TransmissionLineInterface] = {}
@@ -347,6 +356,7 @@ class EMTPSolver:
         self._indexer = NodeIndexer()   # external id ↔ compact index
         self._runtime = DynamicDeviceRuntime(self.dt)
         self._resolve_mgr = ResolveManager(max_iter=self._MAX_SEG_ITER)
+        self._result_store: Optional[ResultStore] = None
         self._stamping = StampingEngine(
             self._indexer,
             allow_singular_regularization=allow_singular_regularization,
@@ -1521,6 +1531,11 @@ class EMTPSolver:
                     self._update_node_count(nf, nt)
         self.mark_topology_changed(f"add UMEC transformer: {name}")
 
+        if self.use_multiport_transformers:
+            self._register_multiport_device(
+                UMECTransformerDevice(name, xfmr)
+            )
+
         logger.debug("添加 UMEC 变压器 %s: %d×%d 绕组, S=%.2f MVA",
                      name, xfmr.n_phases, xfmr.n_windings,
                      data.S_rated / 1e6)
@@ -1694,6 +1709,12 @@ class EMTPSolver:
         """添加无损 Bergeron 单相传输线。"""
         line = BergeronLine(name, node_k, node_m, Zc, tau)
         self.add_line(line)
+        # Register MultiPortDevice adapter (idempotent; activated by
+        # use_multiport_lines flag in _build_MNA_matrix / _build_MNA_rhs).
+        if self.use_multiport_lines:
+            self._register_multiport_device(
+                BergeronLineDevice(name, line, node_k, node_m)
+            )
         return line
 
     def add_ulm_line(
@@ -1752,6 +1773,10 @@ class EMTPSolver:
 
         self._attach_ulm_equivalents(line, length)
         self.add_line(line)
+        if self.use_multiport_lines:
+            self._register_multiport_device(
+                ULMLineDevice(name, line, nodes_k, nodes_m)
+            )
         return line
 
     @staticmethod
@@ -1802,6 +1827,46 @@ class EMTPSolver:
         self, name: str,
     ) -> Optional[TransmissionLineInterface]:
         return self.transmission_lines.get(name)
+
+    # =========================================================================
+    # MultiPortDevice 注册表与统一 dispatch（骨架，默认空注册表）
+    # =========================================================================
+
+    def _register_multiport_device(self, dev) -> None:
+        """Register a :class:`MultiPortDevice` for unified dispatch."""
+        self._multiport_devices.append(dev)
+        self._stamping.mark_dirty()
+
+    def _register_multiport_nodes(self) -> None:
+        for dev in self._multiport_devices:
+            dev.register_nodes(self._indexer)
+
+    def _stamp_multiport_G(self, stamper) -> None:
+        for dev in self._multiport_devices:
+            if dev.contributes_G:
+                dev.stamp_G(stamper, self._indexer)
+
+    def _stamp_multiport_rhs(self, rhs, t: float) -> None:
+        for dev in self._multiport_devices:
+            dev.stamp_rhs(rhs, self._indexer, t)
+
+    def _update_multiport_after_solve(self, V, t: float) -> None:
+        for dev in self._multiport_devices:
+            dev.update_after_solve(V, self._indexer, t)
+
+    def _update_multiport_history(self, V, dt: float) -> None:
+        for dev in self._multiport_devices:
+            if dev.is_dynamic:
+                dev.update_history(V, self._indexer, dt)
+
+    def _check_multiport_rebuild_required(self, V, t: float) -> bool:
+        changed = False
+        for dev in self._multiport_devices:
+            if dev.check_rebuild_required(V, self._indexer, t):
+                changed = True
+        if changed:
+            self._stamping.mark_dirty()
+        return changed
 
     # =========================================================================
     # 系统矩阵装配
@@ -1911,6 +1976,9 @@ class EMTPSolver:
         # ---- 1. 支路历史源 ----
         for dev in self._devices:
             dev.stamp_rhs(rhs, self._indexer, self.time)
+
+        # ---- 1b. MultiPortDevice history sources ----
+        self._stamp_multiport_rhs(rhs, self.time)
 
         # ---- 2. 电流源 ----
         if self.pre_sample_sources and self._current_source_samples:
@@ -2759,6 +2827,9 @@ class EMTPSolver:
         for dev in self._devices:
             dev.reset_state()
 
+        for dev in self._multiport_devices:
+            dev.reset_state()
+
         self.seg_helper.reset_all()
         for name, model in getattr(self.seg_helper, 'elements', {}).items():
             if name not in self.branches:
@@ -2824,23 +2895,13 @@ class EMTPSolver:
         if self.verbose:
             self._log_run_header()
 
-        # 预分配输出
+        # 预分配输出 — 委托给 ResultStore，并将旧属性别名化
         n_steps = int(round(self.finish_time / self.dt)) + 1
-        self._time_array_buf = np.zeros(n_steps)
-        self._voltage_buf = (
-            np.zeros((self._indexer.n, n_steps))
-            if self.record_all_node_voltages
-            else None
-        )
-        self._vs_current_bufs: Dict[str, np.ndarray] = (
-            {name: np.zeros(n_steps) for name in self.voltage_sources}
-            if self.record_source_history else {}
-        )
+        self._init_result_store(n_steps)
 
         # Empty circuits are useful as a timing-grid smoke test and should not
         # enter MNA assembly, where there is intentionally no matrix to solve.
         if self._is_empty_circuit():
-            self._init_probe_storage(n_steps)
             self._time_array_buf[:] = np.arange(n_steps, dtype=np.float64) * self.dt
             self._actual_steps = n_steps
             self.step_count = n_steps
@@ -2887,17 +2948,6 @@ class EMTPSolver:
             and name not in self._lpm_elements
             for name, b in self.branches.items()
         )
-
-        # 预分配支路历史缓冲区。默认不记录支路历史，避免不必要的每步对象写入。
-        if self.record_branch_history:
-            self._branch_v_bufs = {name: np.zeros(n_steps) for name in self.branches}
-            self._branch_i_bufs = {name: np.zeros(n_steps) for name in self.branches}
-        else:
-            self._branch_v_bufs = {}
-            self._branch_i_bufs = {}
-
-        # 预分配轻量探针缓冲区
-        self._init_probe_storage(n_steps)
 
         # MNA: 预建有序电压源列表(供 _build_MNA_matrix 和 _build_MNA_rhs 使用)
         self._vs_list = list(self.voltage_sources.values())
@@ -2987,25 +3037,24 @@ class EMTPSolver:
         if self._ulm_batch is not None and hasattr(self._ulm_batch, 'export_model_state_to_lines'):
             self._ulm_batch.export_model_state_to_lines()
 
-        # 截断处理浮点时间累积误差
-        actual_steps = n_steps
-        self._actual_steps = actual_steps
-        self.time_array = self._time_array_buf[:actual_steps]
+        # 截断处理浮点时间累积误差 — 委托给 ResultStore.finalize
+        self._actual_steps = n_steps
+
+        if self._result_store is not None:
+            # Existing write paths alias into ResultStore arrays directly,
+            # so _steps_written stays 0.  Set it before finalize.
+            self._result_store._steps_written = n_steps
+            self._result_store.finalize(self._indexer)
+
+        # Sync legacy attributes from ResultStore (backward compat)
+        self.time_array = self._time_array_buf[:n_steps]
         if self._voltage_buf is not None:
             self.voltage_results = {
-                self._indexer.to_external(c): self._voltage_buf[c, :actual_steps]
+                self._indexer.to_external(c): self._voltage_buf[c, :n_steps]
                 for c in range(self._indexer.n)
             }
         else:
             self.voltage_results = {}
-        for name in self.voltage_sources:
-            if name in self._vs_current_bufs:
-                self._vs_current_bufs[name] = self._vs_current_bufs[name][:actual_steps]
-
-        if self._voltage_probe_data is not None:
-            self._voltage_probe_data = self._voltage_probe_data[:actual_steps, :]
-        if self._branch_current_probe_data is not None:
-            self._branch_current_probe_data = self._branch_current_probe_data[:actual_steps, :]
 
         t_run_end = _t()
         self._timing['run_total'] = t_run_end - t_run_start
@@ -3027,6 +3076,46 @@ class EMTPSolver:
         self._vs_list = None
         self._vs_index_map = None
         self._rhs_buf = None
+
+    def _init_result_store(self, n_steps: int) -> None:
+        """Create :class:`ResultStore` and alias legacy buffer attributes.
+
+        After this call every pre-existing buffer reference
+        (``_time_array_buf``, ``_voltage_buf``, ``_branch_v_bufs``,
+        ``_vs_current_bufs``, probe data arrays, etc.) points into the
+        ``ResultStore`` so existing write paths work unchanged.
+        """
+        vp_names = list(self.voltage_probes.keys())
+        cp_names = list(self.branch_current_probes.keys())
+
+        self._result_store = ResultStore(
+            n_nodes=self._indexer.n,
+            n_steps=n_steps,
+            record_node_voltage=self.record_all_node_voltages,
+            vs_names=list(self.voltage_sources.keys()),
+            record_branch_history=bool(self.record_branch_history),
+            branch_names=list(self.branches.keys()),
+            voltage_probe_names=vp_names,
+            branch_current_probe_names=cp_names,
+        )
+
+        # Alias legacy attributes so all existing per-step write paths
+        # (step_post_solve_V_I, _record_probes, run() body, etc.)
+        # transparently route into the ResultStore.
+        rs = self._result_store
+        self._time_array_buf = rs.time
+        self._voltage_buf = rs.voltage
+        self._vs_current_bufs = rs.vs_current
+        self._branch_v_bufs = rs.branch_v
+        self._branch_i_bufs = rs.branch_i
+        self._voltage_probe_data = rs.voltage_probe_data
+        self._branch_current_probe_data = rs.branch_current_probe_data
+
+        # Rebuild probe-index metadata (previously in _init_probe_storage).
+        self._voltage_probe_names = vp_names
+        self._branch_current_probe_names = cp_names
+        self._voltage_probe_index = {n: i for i, n in enumerate(vp_names)}
+        self._branch_current_probe_index = {n: i for i, n in enumerate(cp_names)}
 
     def _log_run_header(self) -> None:
         """仿真启动时的概要日志。"""

@@ -113,3 +113,101 @@ class TestBergeronLineDevice:
         dev.register_nodes(indexer)
         dev.register_nodes(indexer)  # second call should not error
         assert indexer.n == 2
+
+
+@pytest.mark.skipif(not BERGERON_AVAILABLE,
+                    reason="transmission_line_emtp_v2 not installed")
+class TestBergeronMultiportIntegration:
+    """Verify the adapter is registered in the solver and dispatch
+    produces the same G/RHS as the legacy transmission-line path."""
+
+    def test_add_bergeron_registers_multiport_when_enabled(self):
+        from emtp_solver_v3 import EMTPSolver
+
+        s = EMTPSolver(dt=1e-6, finish_time=10e-6, verbose=False,
+                       use_multiport_lines=True)
+        s.add_bergeron_line("bl", 1, 2, Zc=300.0, tau=10e-6)
+        assert len(s._multiport_devices) == 1
+        mpd = s._multiport_devices[0]
+        assert mpd.name == "bl"
+        assert mpd.ports == ((1, 0), (2, 0))
+
+    def test_no_multiport_when_flag_false(self):
+        from emtp_solver_v3 import EMTPSolver
+
+        s = EMTPSolver(dt=1e-6, finish_time=10e-6, verbose=False,
+                       use_multiport_lines=False)
+        s.add_bergeron_line("bl", 1, 2, Zc=300.0, tau=10e-6)
+        assert len(s._multiport_devices) == 0
+
+    def test_solver_runs_with_multiport_enabled(self):
+        from emtp_solver_v3 import EMTPSolver
+
+        s = EMTPSolver(dt=1e-6, finish_time=50e-6, verbose=False,
+                       use_multiport_lines=False)
+        s.add_VS("vs1", 1, 0, lambda t: 1.0)
+        s.add_R("rload", 2, 0, 50.0)
+        line = s.add_bergeron_line("bl", 1, 2, Zc=300.0, tau=10e-6)
+        line.initialize(s.dt)
+        s.run()
+
+        v1 = s.get_node_voltage(1, "V")
+        assert len(v1) == 51
+        assert v1[0] > 0  # initial voltage propagates
+
+    def test_adapter_vs_legacy_matrix_equivalence(self):
+        """The BergeronLineDevice adapter stamps the same G as the legacy path."""
+        from emtp.nodes import NodeIndexer
+        from emtp.stamping import COOStamper
+
+        line = BergeronLine("bl", 1, 2, Zc=300.0, tau=10e-6)
+        line.initialize(1e-6)
+
+        # Build indexer
+        indexer = NodeIndexer()
+        indexer.register(1)
+        indexer.register(2)
+        indexer.freeze()
+        n = indexer.n
+
+        # Legacy stamp
+        stamper_legacy = COOStamper(n)
+        G_eq = float(line.G_eq)
+        stamper_legacy.add(0, 0, G_eq)  # node 1 k-k
+        stamper_legacy.add(1, 1, G_eq)  # node 2 m-m
+        G_legacy = stamper_legacy.tocsc()
+
+        # Adapter stamp
+        dev = BergeronLineDevice("bl", line, 1, 2)
+        stamper_adapter = COOStamper(n)
+        dev.stamp_G(stamper_adapter, indexer)
+        G_adapter = stamper_adapter.tocsc()
+
+        assert (G_legacy - G_adapter).nnz == 0
+
+    def test_adapter_vs_legacy_rhs_equivalence(self):
+        """The BergeronLineDevice adapter stamps the same RHS as the legacy path."""
+        from emtp.nodes import NodeIndexer
+
+        line = BergeronLine("bl", 1, 2, Zc=300.0, tau=10e-6)
+        line.initialize(1e-6)
+        line.I_hist_k = 0.5
+        line.I_hist_m = -0.3
+
+        indexer = NodeIndexer()
+        indexer.register(1)
+        indexer.register(2)
+        indexer.freeze()
+        n = indexer.n
+
+        # Legacy RHS
+        rhs_legacy = np.zeros(n)
+        rhs_legacy[0] -= 0.5  # node k
+        rhs_legacy[1] -= -0.3  # node m (= +0.3)
+
+        # Adapter RHS
+        dev = BergeronLineDevice("bl", line, 1, 2)
+        rhs_adapter = np.zeros(n)
+        dev.stamp_rhs(rhs_adapter, indexer, 0.0)
+
+        assert np.allclose(rhs_legacy, rhs_adapter)
