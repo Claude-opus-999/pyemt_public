@@ -3327,6 +3327,92 @@ class EMTPSolver:
         stats['mna_size'] = self.num_nodes + len(self.voltage_sources)
         return stats
 
+    # =========================================================================
+    # Snapshot / Resume
+    # =========================================================================
+
+    def save_snapshot(
+        self, path, *, config=None, notes: str = "",
+    ) -> None:
+        """Save the current solver state to *path*.
+
+        Creates a directory with metadata.json, branches.json, lines.json,
+        lpm.json and arrays.npz.  Restore with :meth:`load_snapshot`.
+        """
+        from emtp.snapshot.serializer import save_snapshot as _save
+        _save(self, path, config=config, notes=notes)
+
+    def load_snapshot(self, path, *, strict: bool = True) -> None:
+        """Restore dynamic state from a previously-saved snapshot directory.
+
+        The solver must already have the correct topology (branches, lines,
+        transformers).  Only dynamic state is restored.
+        """
+        from emtp.snapshot.restore import load_snapshot_into_solver
+        load_snapshot_into_solver(self, path, strict=strict)
+
+    def run_until(self, t_end: float, *, reset_state: bool = False) -> None:
+        """Run the simulation from the current time to *t_end*.
+
+        When *reset_state* is ``False`` (default), preserves existing
+        dynamic state (branch histories, LPM leader length, etc.) and
+        continues from the solver's current time.
+
+        When *reset_state* is ``True``, resets all dynamic state before
+        running (equivalent to a fresh :meth:`run`).
+        """
+        old_finish = self.finish_time
+        old_time = self.time
+
+        try:
+            self.finish_time = t_end
+
+            if reset_state:
+                self.reset_dynamic_state()
+                self._stats = self._fresh_stats()
+                self._timing = defaultdict(float)
+                self._reset_caches()
+            else:
+                # Clear caches so MNA rebuilds on next solve
+                self._reset_caches()
+                self.mark_topology_changed("run_until resume")
+
+            self._is_running = True
+
+            n_steps = int(round((t_end - self.time) / self.dt))
+            if n_steps <= 0:
+                return
+
+            # Allocate fresh ResultStore for the new segment
+            self._init_result_store(n_steps)
+            self._vs_list = list(self.voltage_sources.values())
+            self._vs_index_map = {
+                vs.name: idx for idx, vs in enumerate(self._vs_list)
+            }
+
+            if not self._is_empty_circuit():
+                self._indexer.freeze()
+                self._compact_n = self._indexer.n
+                self._stepper.run(self, n_steps, self._timing)
+
+            # Finalize results
+            if self._result_store is not None:
+                self._result_store._steps_written = n_steps
+                self._result_store.finalize(self._indexer)
+
+            self._actual_steps = n_steps
+            self.time_array = self._time_array_buf[:n_steps]
+            if self._voltage_buf is not None:
+                self.voltage_results = {
+                    self._indexer.to_external(c): self._voltage_buf[c, :n_steps]
+                    for c in range(self._indexer.n)
+                }
+            self._results_valid = True
+            self.time = t_end
+
+        finally:
+            self.finish_time = old_finish
+
     def print_solver_statistics(self) -> None:
         """打印求解统计(用户侧报告)。"""
         stats = self.get_solver_statistics()

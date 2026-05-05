@@ -1,0 +1,60 @@
+{
+  "schema_version": "0.1.0",
+  "case_name": "bergeron_matched",
+  "description": "Bergeron line with matched load — no reflection expected",
+  "simulation": {
+    "dt": 1e-7,
+    "finish_time": 30e-6,
+    "verbose": false,
+    "record_all_node_voltages": false,
+    "record_line_history": true,
+    "record_branch_history": true
+  },
+  "elements": [
+    {
+      "kind": "resistor",
+      "name": "R_source",
+      "node_from": 1,
+      "node_to": 2,
+      "R": 300.0
+    },
+    {
+      "kind": "bergeron_line",
+      "name": "BL1",
+      "node_k": 2,
+      "node_m": 3,
+      "Zc": 300.0,
+      "tau": 10e-6
+    },
+    {
+      "kind": "resistor",
+      "name": "R_load",
+      "node_from": 3,
+      "node_to": 0,
+      "R": 300.0
+    }
+  ],
+  "sources": [
+    {
+      "kind": "voltage",
+      "name": "VS1",
+      "node_pos": 1,
+      "node_neg": 0,
+      "voltage": 10.0
+    }
+  ],
+  "probes": [
+    {
+      "kind": "voltage",
+      "name": "V_send",
+      "node_pos": 2,
+      "node_neg": 0
+    },
+    {
+      "kind": "voltage",
+      "name": "V_recv",
+      "node_pos": 3,
+      "node_neg": 0
+    }
+  ]
+}

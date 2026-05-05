@@ -1,0 +1,50 @@
+{
+  "schema_version": "0.1.0",
+  "case_name": "rc_step",
+  "description": "RC step response — capacitor charges through resistor from DC source",
+  "simulation": {
+    "dt": 1e-6,
+    "finish_time": 100e-6,
+    "verbose": false,
+    "record_all_node_voltages": false,
+    "record_branch_history": true
+  },
+  "elements": [
+    {
+      "kind": "resistor",
+      "name": "R1",
+      "node_from": 1,
+      "node_to": 2,
+      "R": 10.0
+    },
+    {
+      "kind": "capacitor",
+      "name": "C1",
+      "node_from": 2,
+      "node_to": 0,
+      "C": 1e-6
+    }
+  ],
+  "sources": [
+    {
+      "kind": "voltage",
+      "name": "VS1",
+      "node_pos": 1,
+      "node_neg": 0,
+      "voltage": 1.0
+    }
+  ],
+  "probes": [
+    {
+      "kind": "voltage",
+      "name": "V_cap",
+      "node_pos": 2,
+      "node_neg": 0
+    },
+    {
+      "kind": "branch_current",
+      "name": "I_R1",
+      "branch": "R1"
+    }
+  ]
+}
