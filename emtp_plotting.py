@@ -25,7 +25,6 @@ from __future__ import annotations
 
 from typing import Optional, Sequence
 
-import matplotlib.pyplot as plt
 
 
 def _pretty_label(name: str) -> str:
@@ -87,6 +86,8 @@ def plot_probes(
     time_unit:
         Time unit: "s", "ms", "us", or "ns".
     """
+    import matplotlib.pyplot as plt
+
     t = solver.get_time(time_unit)
 
     plt.figure(figsize=figsize)

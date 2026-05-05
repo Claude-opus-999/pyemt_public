@@ -617,7 +617,7 @@ class UMECTransformer:
 # 便捷创建函数
 # =============================================================================
 
-def create_umec_transformer_3ph_bank(
+def create_umec_transformer_3ph_bank_data(
     name: str,
     S_mva: float,
     V1_kV: float,
@@ -633,14 +633,18 @@ def create_umec_transformer_3ph_bank(
     **kwargs
 ) -> UMECTransformerData:
     """
-    便捷函数: 创建三相组两绕组变压器数据
+    Create UMECTransformerData for a three-phase two-winding transformer bank.
+
+    This is the recommended factory — the name explicitly says it returns *data*,
+    not a transformer instance.  Pass the result to ``UMECTransformer(data, dt)``
+    or to ``EMTPSolver.add_UMEC_transformer()``.
 
     Parameters
     ----------
     S_mva : float
-        额定容量 (MVA)
+        Rated power (MVA).
     V1_kV, V2_kV : float
-        一次/二次侧额定线电压 (kV)
+        Primary / secondary rated line-line voltage (kV).
     """
     return UMECTransformerData(
         name=name,
@@ -657,6 +661,95 @@ def create_umec_transformer_3ph_bank(
     )
 
 
+def create_umec_transformer_3ph_bank_instance(
+    *,
+    dt: float,
+    name: str,
+    S_mva: float,
+    V1_kV: float,
+    V2_kV: float,
+    wtype1: str = 'Y',
+    wtype2: str = 'Delta',
+    X_leak_pu: float = 0.08,
+    Im_percent: float = 1.0,
+    freq: float = 50.0,
+    NLL_pu: float = 0.0,
+    CL_pu: float = 0.0,
+    nodes: Optional[List[List[Tuple[int, int]]]] = None,
+    verbose: bool = False,
+    **kwargs
+) -> UMECTransformer:
+    """
+    Create a fully-initialised UMECTransformer instance.
+
+    Convenience wrapper that builds the data object and the transformer
+    in one call.  Returns a ``UMECTransformer`` ready to be added to a solver
+    via ``EMTPSolver.add_UMEC_transformer()``.
+
+    Parameters
+    ----------
+    dt : float
+        Simulation time step (s).
+    verbose : bool
+        Passed to ``UMECTransformer.__init__``.
+    """
+    data = create_umec_transformer_3ph_bank_data(
+        name=name,
+        S_mva=S_mva,
+        V1_kV=V1_kV,
+        V2_kV=V2_kV,
+        wtype1=wtype1,
+        wtype2=wtype2,
+        X_leak_pu=X_leak_pu,
+        Im_percent=Im_percent,
+        freq=freq,
+        NLL_pu=NLL_pu,
+        CL_pu=CL_pu,
+        nodes=nodes,
+        **kwargs,
+    )
+    return UMECTransformer(data, dt=dt, verbose=verbose)
+
+
+def create_umec_transformer_3ph_bank(
+    name: str,
+    S_mva: float,
+    V1_kV: float,
+    V2_kV: float,
+    wtype1: str = 'Y',
+    wtype2: str = 'Delta',
+    X_leak_pu: float = 0.08,
+    Im_percent: float = 1.0,
+    freq: float = 50.0,
+    NLL_pu: float = 0.0,
+    CL_pu: float = 0.0,
+    nodes: Optional[List[List[Tuple[int, int]]]] = None,
+    **kwargs
+) -> UMECTransformerData:
+    """
+    Legacy factory — returns UMECTransformerData, not a transformer instance.
+
+    .. deprecated::
+        Use :func:`create_umec_transformer_3ph_bank_data` for clarity.
+        This function is kept for backward compatibility.
+    """
+    return create_umec_transformer_3ph_bank_data(
+        name=name,
+        S_mva=S_mva,
+        V1_kV=V1_kV,
+        V2_kV=V2_kV,
+        wtype1=wtype1,
+        wtype2=wtype2,
+        X_leak_pu=X_leak_pu,
+        Im_percent=Im_percent,
+        freq=freq,
+        NLL_pu=NLL_pu,
+        CL_pu=CL_pu,
+        nodes=nodes,
+        **kwargs
+    )
+
+
 # =============================================================================
 # 导出
 # =============================================================================
@@ -666,5 +759,7 @@ __all__ = [
     'UMECTransformerData',
     'UMECSaturationModel',
     'UMECTransformer',
-    'create_umec_transformer_3ph_bank',
+    'create_umec_transformer_3ph_bank_data',
+    'create_umec_transformer_3ph_bank_instance',
+    'create_umec_transformer_3ph_bank',  # legacy
 ]

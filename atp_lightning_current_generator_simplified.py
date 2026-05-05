@@ -539,6 +539,7 @@ class BaseLightningCurrentSource:
         self.fit_error = fit_error
 
         self.ui = ATP_CURRENT_UI
+        self._scalar_buf = np.empty(1, dtype=float)
 
         self.t_peak_raw, self.raw_peak = self._find_raw_peak()
         if self.raw_peak <= 0 or not isfinite(self.raw_peak):
@@ -592,9 +593,21 @@ class BaseLightningCurrentSource:
         raw = float(self._raw(np.array([t_rel], dtype=float))[0])
         return float(self.peak) * float(self.k_factor) * raw
 
+    def current_at_scalar(self, t: float) -> float:
+        """Fast scalar path: reuses a pre-allocated buffer to avoid per-call
+        ``np.array([t_rel])`` allocation in the inner simulation loop."""
+        t_rel = float(t) - self.Tstart
+        if t_rel < 0.0:
+            return 0.0
+        if self.Tstop is not None and float(t) > self.Tstop:
+            return 0.0
+        self._scalar_buf[0] = t_rel
+        raw = float(self._raw(self._scalar_buf)[0])
+        return float(self.peak) * float(self.k_factor) * raw
+
     def to_callable(self) -> Callable[[float], float]:
         """Return a scalar callable suitable for EMTPSolver current sources."""
-        return lambda t: self.current_at(t)
+        return self.current_at_scalar
 
     def verify_peak(self) -> Tuple[float, float, float]:
         actual = self.peak * self.k_factor * float(

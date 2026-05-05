@@ -1,17 +1,23 @@
-"""EMTP 电磁暂态仿真求解器。
+"""EMTP electromagnetic transient simulation solver (legacy entry point).
 
-融合:
-- 多相传输线(Bergeron / ULM)
-- PSCAD 分段线性法求解非线性元件(MOA 避雷器等)
-- MNA(修正节点分析）处理理想电压源
-- UMEC 多端口变压器模型
-- CIGRE 先导发展法绝缘子闪络开关(LPM)
+Preferred import::
 
-性能优化
---------
-- MNA 稀疏矩阵(scipy.sparse CSC):仅在开关/段切换时重建,否则复用缓存
-- KLU 稀疏分解(SuiteSparse):电路矩阵最优 O(nnz) 分解,回退 SuperLU
-- 预分配输出数组,消除 list.append 动态扩容开销
+    from emtp import EMTPSolver
+
+This module is kept for backward compatibility.  Existing scripts
+that use ``from emtp_solver_v3 import EMTPSolver`` continue to work.
+
+Supports:
+- Multi-phase transmission lines (Bergeron / ULM)
+- PSCAD segmented nonlinear elements (MOA arresters)
+- MNA (Modified Nodal Analysis) with ideal voltage sources
+- UMEC multi-port transformer model
+- CIGRE leader-progression-model insulator flashover (LPM)
+
+Performance:
+- MNA sparse matrix (scipy.sparse CSC): rebuilt only on topology changes
+- SuperLU sparse LU decomposition: cached when topology is unchanged
+- Pre-allocated output arrays eliminate dynamic list-appends
 """
 
 from __future__ import annotations
@@ -142,6 +148,33 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Re-export from emtp package modules (P3 modularisation)
+# These were originally defined inline; now sourced from the new package.
+# ---------------------------------------------------------------------------
+from emtp.nodes import NodeBook, NodeIndexer           # noqa: E402, F811
+from emtp.types import (                                # noqa: E402, F811
+    VoltageSource, ValidationIssue, ValidationReport,
+    RHSPlan, ElementType, Branch, CurrentSource, LineData,
+)
+from emtp.sparse_solver import (                        # noqa: E402
+    _SPARSE_SOLVER_NAME as _SPARSE_SOLVER_NAME,
+    _sparse_factorize as _sparse_factorize,
+    SparseLinearSolver,
+)
+from emtp.stamping import COOStamper, StampingEngine    # noqa: E402, F811
+from emtp.devices import (                               # noqa: E402, F811
+    Device,
+    ResistorDevice,
+    InductorDevice,
+    CapacitorDevice,
+    SwitchDevice,
+    SeriesRLDevice,
+    NonlinearResistorDevice,
+    LPMFlashoverDevice,
+    _update_series_rl_history_static,
+)
+from emtp.runtime import DynamicDeviceRuntime           # noqa: E402, F811
 
 # ---------------------------------------------------------------------------
 # 可选模块:ULM / UMEC
@@ -181,161 +214,183 @@ except ImportError:
 
 
 
-class NodeBook:
-    """节点命名管理器:把字符串节点名映射成 EMTPSolver 使用的整数节点。
+# ---------------------------------------------------------------------------
+# NodeIndexer & NodeBook — imported from emtp.nodes
+# ---------------------------------------------------------------------------
 
-    设计要点
-    --------
-    - 整数节点(如 0, 1, 2, ...)直接透传,保持向后兼容。
-    - 字符串节点名首次出现时自动分配下一个可用整数编号。
-    - 特殊名称(GND/0/ground 等)统一映射为 0(地)。
-    - 支持手动绑定(reserve)和别名(alias),便于和已有整数节点模型共存。
 
-    使用示例
-    --------
-    >>> book = NodeBook()
-    >>> book.get("T1.tower_top")   # 自动分配为 1
-    1
-    >>> book.get("GND")            # 地节点
-    0
-    >>> book.get(5)                # 整数透传
-    5
+# ---------------------------------------------------------------------------
+# VoltageSource / ValidationIssue / ValidationReport / RHSPlan — imported from emtp.types
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Device Protocol — 元件抽象接口
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+
+class DynamicDeviceRuntime:
+    """Per-step state management for devices, switches and reactive elements.
+
+    Encapsulates the operations that happen at each time step around the
+    core MNA-solve so the solver's main loop stays short and declarative.
     """
 
-    GROUND_NAMES = {"0", "GND", "gnd", "ground", "GROUND", "Ground"}
+    def __init__(self, dt: float) -> None:
+        self._dt = dt
 
-    def __init__(self, start: int = 1):
-        if start < 1:
-            raise ValueError("NodeBook start must be >= 1")
-        self._next = int(start)
-        self._name_to_id: Dict[str, int] = {}
-        self._id_to_name: Dict[int, str] = {}
+    # -- pre-solve ----------------------------------------------------------
 
-    def get(self, node: Union[str, int, np.integer]) -> int:
-        """返回节点整数编号。若是新字符串节点名,则自动分配。"""
-        if isinstance(node, (int, np.integer)):
-            if int(node) < 0:
-                raise ValueError(f"节点编号必须 >= 0,当前为 {node}")
-            return int(node)
+    def step_pre_solve(
+        self, t: float,
+        devices: List[Device],
+        lpm_names: set,
+    ) -> bool:
+        """Apply timed switch events.  Return True if topology changed."""
+        changed = False
+        for dev in devices:
+            if not isinstance(dev, SwitchDevice):
+                continue
+            if dev.name in lpm_names:
+                continue
+            if dev.update_timed_state(t):
+                changed = True
+        return changed
 
-        name = str(node)
-        if name in self.GROUND_NAMES:
-            return 0
+    # -- post-solve (branch V/I update, then history after probes) ---------
 
-        if name not in self._name_to_id:
-            node_id = self._next
-            self._name_to_id[name] = node_id
-            self._id_to_name[node_id] = name
-            self._next += 1
+    def step_post_solve_V_I(
+        self, V: np.ndarray,
+        devices: List[Device],
+        indexer: NodeIndexer,
+        step_idx: int,
+        n_steps: int,
+        record_history: bool,
+        branch_v_bufs: Dict[str, np.ndarray],
+        branch_i_bufs: Dict[str, np.ndarray],
+    ) -> None:
+        """Update branch voltage / current from MNA solution.
 
-        return self._name_to_id[name]
-
-    def reserve(self, name: str, node_id: Optional[int] = None) -> int:
-        """手动绑定一个节点名。可用于和旧整数节点兼容。"""
-        if name in self.GROUND_NAMES:
-            return 0
-
-        if node_id is None:
-            return self.get(name)
-
-        node_id = int(node_id)
-        if node_id <= 0:
-            raise ValueError("非地节点编号必须 > 0")
-
-        if name in self._name_to_id and self._name_to_id[name] != node_id:
-            raise ValueError(
-                f"节点名 {name!r} 已绑定到 {self._name_to_id[name]}"
-            )
-
-        if node_id in self._id_to_name and self._id_to_name[node_id] != name:
-            raise ValueError(
-                f"节点号 {node_id} 已绑定到 {self._id_to_name[node_id]!r}"
-            )
-
-        self._name_to_id[name] = node_id
-        self._id_to_name[node_id] = name
-        self._next = max(self._next, node_id + 1)
-        return node_id
-
-    def alias(self, alias_name: str, existing: Union[str, int]) -> int:
-        """给已有节点增加别名(多个名字共享同一 id)。
-
-        ``_id_to_name`` 仅保留首个/主名,``_name_to_id`` 中
-        追加 alias_name → node_id 的映射。
+        Must be called BEFORE probe recording so that probes see the
+        correct per-step branch quantities, not the next-step Ihist.
         """
-        node_id = self.get(existing)
-        if node_id == 0:
-            return 0
+        use_buf = (
+            record_history and step_idx >= 0 and step_idx < n_steps
+            and bool(branch_v_bufs)
+        )
+        for dev in devices:
+            et = dev._branch.element_type
+            if not record_history and et in (ElementType.RESISTOR, ElementType.SWITCH):
+                continue
 
-        if alias_name in self.GROUND_NAMES:
-            raise ValueError(f"不能用保留名 {alias_name!r} 作为别名")
+            dev.update_branch_quantities(V, indexer)
 
-        if alias_name in self._name_to_id:
-            if self._name_to_id[alias_name] != node_id:
-                raise ValueError(
-                    f"别名 {alias_name!r} 已绑定到节点 "
-                    f"{self._name_to_id[alias_name]},不能改绑到 {node_id}"
+            br = dev._branch
+            if use_buf:
+                branch_v_bufs[dev.name][step_idx] = br.voltage
+                branch_i_bufs[dev.name][step_idx] = br.current
+            elif record_history:
+                br.voltage_history.append(br.voltage)
+                br.current_history.append(br.current)
+
+    def step_post_solve_history(
+        self, devices: List[Device],
+    ) -> None:
+        """Advance reactive history sources (L, C, SRL) after probes."""
+        for dev in devices:
+            dev.update_history(self._dt)
+
+    # -- post-solve resolve triggers (LPM + UMEC) --------------------------
+
+    def post_solve_resolve_check(
+        self, V: np.ndarray, t: float,
+        lpm_elements: Dict[str, Any],
+        lpm_node_map: Dict[str, Tuple[int, int]],
+        transformers: Dict[str, Any],
+        seg_node_map: Dict[str, Tuple[int, int]],
+        seg_helper: Any,
+        branches: Dict[str, Branch],
+        indexer: NodeIndexer,
+        mark_dirty_callback,
+        stats: Dict[str, Any],
+    ) -> bool:
+        """Check LPM flashover and UMEC saturation after a solve.
+
+        Returns True if a re-solve is needed (circuit topology changed).
+        The caller is expected to re-assemble MNA and solve again.
+        """
+        any_change = False
+
+        # --- LPM flashover check ---
+        if lpm_elements:
+            for name, lpm in lpm_elements.items():
+                nf, nt = lpm_node_map[name]
+                v_branch = 0.0
+                if nf > 0:
+                    v_branch += V[indexer.to_compact(nf)]
+                if nt > 0:
+                    v_branch -= V[indexer.to_compact(nt)]
+
+                br = branches[name]
+                current_A = br.Geq * v_branch
+                state_changed = lpm.update(
+                    voltage_V=v_branch,
+                    dt=self._dt,
+                    current_A=current_A,
+                    time=t,
                 )
-            return node_id
 
-        # 直接写入 name→id;不更新 id→name(主名优先)
-        self._name_to_id[alias_name] = node_id
-        return node_id
+                if state_changed:
+                    any_change = True
+                    br.is_closed = bool(lpm.is_flashed_over)
+                    br.value = lpm.R_current
+                    br.Geq = lpm.G_current
+                    event = "LPM flashover" if lpm.is_flashed_over else "LPM extinction"
+                    mark_dirty_callback(f"{event}: {name}")
+                    if lpm.is_flashed_over:
+                        stats['lpm_flashovers'] = stats.get('lpm_flashovers', 0) + 1
+                    else:
+                        stats['lpm_extinctions'] = stats.get('lpm_extinctions', 0) + 1
 
-    def name_of(self, node_id: int) -> Optional[str]:
-        """由整数节点反查名字。"""
-        node_id = int(node_id)
-        if node_id == 0:
-            return "GND"
-        return self._id_to_name.get(node_id)
+        # --- UMEC saturation check ---
+        if transformers:
+            for name, xfmr in transformers.items():
+                if not hasattr(xfmr, 'check_saturation'):
+                    continue
+                port_nodes = xfmr.get_port_nodes()
+                V_ports = np.zeros(xfmr.m)
+                for k, (nf, nt) in enumerate(port_nodes):
+                    v_f = V[indexer.to_compact(nf)] if nf > 0 else 0.0
+                    v_t = V[indexer.to_compact(nt)] if nt > 0 else 0.0
+                    V_ports[k] = v_f - v_t
+                need_update, updates = xfmr.check_saturation(V_ports)
+                if need_update:
+                    any_change = True
+                    stats['transformer_saturation_switches'] += len(updates)
+                    mark_dirty_callback(f"UMEC saturation: {name}")
 
-    def as_dict(self) -> Dict[str, int]:
-        return dict(self._name_to_id)
+        # --- nonlinear segment check ---
+        if seg_node_map:
+            voltages = {}
+            for name, (nf, nt) in seg_node_map.items():
+                v_i = V[indexer.to_compact(nf)] if nf > 0 else 0.0
+                v_j = V[indexer.to_compact(nt)] if nt > 0 else 0.0
+                voltages[name] = v_i - v_j
 
-    def __len__(self) -> int:
-        return len(self._name_to_id)
+            need_resolve, updates = seg_helper.check_all_segments(voltages)
+            if need_resolve:
+                any_change = True
+                for seg_name, (g_new, i_new) in updates.items():
+                    br = branches[seg_name]
+                    br.Geq = g_new
+                    br.Ihist = i_new
+                    mark_dirty_callback(f"nonlinear segment: {seg_name}")
+                    stats['segment_switches'] = stats.get('segment_switches', 0) + 1
 
-    def __contains__(self, name: str) -> bool:
-        return name in self._name_to_id or name in self.GROUND_NAMES
+        return any_change
 
-    def dump(self) -> None:
-        """打印节点映射表。"""
-        print("节点映射表:")
-        print(f"  {'编号':>6s}  名称")
-        print(f"  {'-'*6}  {'-'*30}")
-        print(f"  {0:>6d}  GND")
-        for name, node_id in sorted(self._name_to_id.items(),
-                                    key=lambda kv: kv[1]):
-            print(f"  {node_id:>6d}  {name}")
-
-
-# ---------------------------------------------------------------------------
-# 电压源数据类
-# ---------------------------------------------------------------------------
-
-@dataclass
-class VoltageSource:
-    """理想电压源(MNA 修正节点分析)。
-
-    MNA 增广方程中电压源引入额外约束行/列,
-    求解后 ``current`` 直接从 MNA 解向量的增广分量获取,
-    正方向:从 node_pos 经外部电路流向 node_neg。
-    """
-
-    name: str
-    node_pos: int
-    node_neg: int
-    voltage_func: Callable[[float], float]
-    current: float = 0.0
-    current_history: list = field(default_factory=list)
-
-    def voltage_at(self, t: float) -> float:
-        return self.voltage_func(t)
-
-
-# ---------------------------------------------------------------------------
-# EMTP 求解器
-# ---------------------------------------------------------------------------
 
 class EMTPSolver:
     """EMTP 电磁暂态仿真求解器。
@@ -392,6 +447,10 @@ class EMTPSolver:
         record_source_history: bool = False,
         sync_line_state_each_step: bool = False,
         allow_singular_regularization: bool = False,
+        record_all_node_voltages: bool = True,
+        max_result_memory_mb: Optional[float] = None,
+        pre_sample_sources: bool = False,
+        use_rhs_plan: bool = False,
     ):
         """
         Parameters
@@ -402,6 +461,21 @@ class EMTPSolver:
             仿真结束时间 (s)。
         verbose : bool
             是否输出详细日志。
+        record_all_node_voltages : bool
+            是否记录所有节点电压历史。开启时会分配
+            ``num_nodes × n_steps`` 的完整电压矩阵，
+            大型网络建议设为 False 并改用探针获取关心量。
+        max_result_memory_mb : float or None
+            结果缓存内存上限(MB)。若估计值超过此阈值,
+            会在运行前发出 warning。None 表示不限制。
+        pre_sample_sources : bool
+            在仿真前对独立电流源和电压源进行预采样。
+            可减少每步 Python 函数调用开销,但会改变
+            source function 的调用时机。默认 False。
+        use_rhs_plan : bool
+            预编译 RHS 装配的拓扑索引,用 flat arrays 替代
+            每步 Python 对象遍历。与 pre_sample_sources
+            搭配效果最佳。默认 False。
         """
         self.dt = dt
         self.finish_time = finish_time
@@ -415,6 +489,14 @@ class EMTPSolver:
         self.record_source_history = bool(record_source_history)
         self.sync_line_state_each_step = bool(sync_line_state_each_step)
         self.allow_singular_regularization = bool(allow_singular_regularization)
+        self.record_all_node_voltages = bool(record_all_node_voltages)
+        self.max_result_memory_mb = (
+            float(max_result_memory_mb) if max_result_memory_mb is not None else None
+        )
+        self.pre_sample_sources = bool(pre_sample_sources)
+        self.use_rhs_plan = bool(use_rhs_plan)
+        self._rhs_plan: Optional[RHSPlan] = None
+        self._rhs_plan_dirty: bool = True
         self._active_mna_solver_name = _SPARSE_SOLVER_NAME
         if self.ulm_batch_mode not in {'auto', 'parallel', 'serial', 'off'}:
             raise ValueError(
@@ -425,6 +507,7 @@ class EMTPSolver:
 
         # ---- 元件存储 ----
         self.branches: Dict[str, Branch] = {}
+        self._devices: List[Device] = []
         self.current_sources: Dict[str, CurrentSource] = {}
         self.voltage_sources: Dict[str, VoltageSource] = {}
         self.transmission_lines: Dict[str, TransmissionLineInterface] = {}
@@ -435,6 +518,12 @@ class EMTPSolver:
         self.num_nodes: int = 0
         self._node_set: set = set()
         self._vs_node_set: set = set()  # 电压源正端节点集合
+        self._indexer = NodeIndexer()   # external id ↔ compact index
+        self._runtime = DynamicDeviceRuntime(self.dt)
+        self._stamping = StampingEngine(
+            self._indexer,
+            allow_singular_regularization=allow_singular_regularization,
+        )
 
         # ---- 命名节点管理 ----
         # 允许使用字符串节点名(如 "T1.tower_top"),
@@ -460,6 +549,9 @@ class EMTPSolver:
         self.step_count: int = 0
         self.time_array: list = []
         self.voltage_results: Dict[int, list] = {}
+        self._actual_steps: int = 0
+        self._results_valid: bool = False
+        self._is_running: bool = False
 
         # ---- 分段线性法 ----
         self._seg_node_map: Dict[str, Tuple[int, int]] = {}
@@ -509,6 +601,10 @@ class EMTPSolver:
         self._ulm_batch_m_nodes_v: Optional[np.ndarray] = None
         self._rhs_buf: Optional[np.ndarray] = None
 
+        # ---- 源预采样缓存 ----
+        self._current_source_samples: Dict[str, np.ndarray] = {}
+        self._voltage_source_samples: Dict[str, np.ndarray] = {}
+
     @staticmethod
     def _fresh_stats() -> Dict[str, Any]:
         return {
@@ -524,13 +620,51 @@ class EMTPSolver:
 
     def mark_topology_changed(self, reason: str = "") -> None:
         """Invalidate cached MNA matrix/factorization after topology changes."""
-        self._G_dirty = True
-        self._cached_MNA = None
-        self._cached_splu = None
+        self._stamping.mark_dirty()
         self._vs_list = None
         self._vs_index_map = None
+        self._rhs_plan_dirty = True
+        if not getattr(self, "_is_running", False):
+            self._invalidate_results()
         if self.verbose and reason:
             logger.debug("MNA matrix marked dirty: %s", reason)
+
+    def _invalidate_results(self) -> None:
+        """Mark stored outputs stale after topology/probe/config changes."""
+        self._results_valid = False
+        self._actual_steps = 0
+
+    def _ensure_unique_device_name(self, name: str, kind: str = "device") -> None:
+        """Reject duplicate public device names before mutating topology."""
+        name = str(name)
+        containers = (
+            ("branch", self.branches),
+            ("current source", self.current_sources),
+            ("voltage source", self.voltage_sources),
+            ("transmission line", self.transmission_lines),
+            ("transformer", self.transformers),
+        )
+        for existing_kind, container in containers:
+            if name in container:
+                raise ValueError(
+                    f"{kind} name {name!r} conflicts with existing {existing_kind}"
+                )
+
+    def _ensure_unique_probe_name(self, name: str) -> None:
+        """Reject duplicate probe names across all probe namespaces."""
+        name = str(name)
+        if name in self.voltage_probes or name in self.branch_current_probes:
+            raise ValueError(f"Probe name {name!r} already exists")
+
+    def _require_run_completed(self) -> None:
+        """Raise a clear error when result APIs are used before run()."""
+        if (
+            not bool(getattr(self, "_results_valid", False))
+            or int(getattr(self, "_actual_steps", 0)) <= 0
+        ):
+            raise RuntimeError(
+                "Simulation results are not available or are stale; call run() first."
+            )
 
     # =========================================================================
     # 节点管理
@@ -543,8 +677,10 @@ class EMTPSolver:
                 for node in n:
                     if node > 0:
                         self._node_set.add(int(node))
+                        self._indexer.register(int(node))
             elif isinstance(n, (int, np.integer)) and n > 0:
                 self._node_set.add(int(n))
+                self._indexer.register(int(n))
         self.num_nodes = max(self._node_set) if self._node_set else 0
 
     # ---- 命名节点解析 (NodeBook 桥接) ----
@@ -568,6 +704,23 @@ class EMTPSolver:
     def _resolve_node(self, node: Union[str, int, np.integer]) -> int:
         """内部使用:解析单个节点(字符串或整数)为整数节点号。"""
         return self.nodes.get(node)
+
+    def _resolve_existing_node(self, node: Union[str, int, np.integer]) -> int:
+        """Resolve a node reference without creating a new named node."""
+        if isinstance(node, (int, np.integer)):
+            node_id = int(node)
+            if node_id < 0:
+                raise ValueError(f"节点编号必须 >= 0,当前为 {node}")
+            return node_id
+
+        name = str(node)
+        if name in self.nodes.GROUND_NAMES:
+            return 0
+        if name not in self.nodes:
+            raise ValueError(
+                f"节点 {name!r} 尚未在电路中定义；探针不会自动创建节点"
+            )
+        return self.nodes.get(name)
 
     def _resolve_nodes(self, nodes):
         """内部使用:递归解析节点或节点列表。"""
@@ -594,20 +747,27 @@ class EMTPSolver:
         node_pos: Union[str, int],
         node_neg: Union[str, int] = 0,
     ) -> None:
-        """注册电压探针，记录 V(node_pos) - V(node_neg)。"""
-        node_pos_id = self._resolve_node(node_pos)
-        node_neg_id = self._resolve_node(node_neg)
+        """注册电压探针，记录 V(node_pos) - V(node_neg)。
+
+        探针只引用既有节点，不改变电路拓扑；字符串节点名必须已经由元件
+        或 reserve_node()/alias_node() 注册。
+        """
+        self._ensure_unique_probe_name(name)
+        node_pos_id = self._resolve_existing_node(node_pos)
+        node_neg_id = self._resolve_existing_node(node_neg)
         self.voltage_probes[str(name)] = {
             "node_pos": int(node_pos_id),
             "node_neg": int(node_neg_id),
         }
-        self._update_node_count(node_pos_id, node_neg_id)
+        self._invalidate_results()
 
     def add_branch_current_probe(self, name: str, branch_name: str) -> None:
         """注册普通支路电流探针。"""
+        self._ensure_unique_probe_name(name)
         self.branch_current_probes[str(name)] = {
             "branch_name": str(branch_name),
         }
+        self._invalidate_results()
 
     def _init_probe_storage(self, n_steps: int) -> None:
         """仿真开始前预分配探针结果数组。"""
@@ -653,11 +813,29 @@ class EMTPSolver:
             raise ValueError(f"Unsupported probe unit: {unit}")
         return values * scale
 
+    @staticmethod
+    def _scale_values(
+        values: np.ndarray,
+        unit: Optional[str],
+        scale_map: Dict[str, float],
+        quantity: str,
+    ) -> np.ndarray:
+        """Scale result arrays and reject unknown units explicitly."""
+        if unit is None:
+            return values.copy()
+        if unit not in scale_map:
+            supported = ", ".join(scale_map)
+            raise ValueError(
+                f"Unsupported {quantity} unit: {unit!r}. Supported: {supported}"
+            )
+        scale = scale_map[unit]
+        return values * scale if scale != 1.0 else values.copy()
+
     def _node_voltage_from_solution(self, V: np.ndarray, node: int) -> float:
         """从 MNA 解向量读取节点电压，0/负节点视为地。"""
         if node <= 0:
             return 0.0
-        return float(V[node - 1])
+        return float(V[self._indexer.to_compact(node)])
 
     def _branch_voltage_from_solution(self, V: np.ndarray, branch: Branch) -> float:
         """Return branch voltage from node_from to node_to for the current solution."""
@@ -721,8 +899,11 @@ class EMTPSolver:
         self._record_branch_current_probes(step, V)
 
     def get_voltage_probe(self, name: str, unit: Optional[str] = "V") -> np.ndarray:
+        self._require_run_completed()
         if name not in self._voltage_probe_index:
             raise KeyError(f"电压探针不存在: {name}")
+        if self._voltage_probe_data is None:
+            raise RuntimeError(f"电压探针 {name!r} 未记录数据")
         idx = self._voltage_probe_index[name]
         actual = getattr(self, "_actual_steps", self._voltage_probe_data.shape[0])
         data = self._voltage_probe_data[:actual, idx]
@@ -733,8 +914,11 @@ class EMTPSolver:
         name: str,
         unit: Optional[str] = "A",
     ) -> np.ndarray:
+        self._require_run_completed()
         if name not in self._branch_current_probe_index:
             raise KeyError(f"支路电流探针不存在: {name}")
+        if self._branch_current_probe_data is None:
+            raise RuntimeError(f"支路电流探针 {name!r} 未记录数据")
         idx = self._branch_current_probe_index[name]
         actual = getattr(self, "_actual_steps", self._branch_current_probe_data.shape[0])
         data = self._branch_current_probe_data[:actual, idx]
@@ -768,16 +952,15 @@ class EMTPSolver:
         R: float,
     ) -> None:
         """添加电阻。支持整数节点号或字符串节点名。"""
+        self._ensure_unique_device_name(name, "resistor")
         node_from = self._resolve_node(node_from)
         node_to = self._resolve_node(node_to)
         if R <= 0:
             raise ValueError(f"电阻值必须为正: R={R}")
-        self.branches[name] = Branch(
-            name=name, element_type=ElementType.RESISTOR,
-            node_from=node_from, node_to=node_to,
-            value=R, Geq=1.0 / R,
-        )
+        dev = ResistorDevice(name, node_from, node_to, R)
+        self.branches[name] = dev._branch
         self._update_node_count(node_from, node_to)
+        self._devices.append(dev)
         self.mark_topology_changed(f"add resistor: {name}")
 
     def add_L(
@@ -786,18 +969,16 @@ class EMTPSolver:
         L: float, Rp: Optional[float] = None,
     ) -> None:
         """添加电感(隐式梯形:G_eq = Δt/(2L))。支持字符串节点名。"""
+        self._ensure_unique_device_name(name, "inductor")
         node_from = self._resolve_node(node_from)
         node_to = self._resolve_node(node_to)
         if L <= 0:
             raise ValueError(f"电感值必须为正: L={L}")
-        Geq_damping = 1.0 / Rp if Rp and Rp > 0 else 0.0
-        self.branches[name] = Branch(
-            name=name, element_type=ElementType.INDUCTOR,
-            node_from=node_from, node_to=node_to,
-            value=L, Geq=self.dt / (2.0 * L),
-            Rp=Rp if Rp else 0.0, Geq_damping=Geq_damping,
-        )
+        dev = InductorDevice(name, node_from, node_to, L, self.dt,
+                             Rp=Rp if Rp else 0.0)
+        self.branches[name] = dev._branch
         self._update_node_count(node_from, node_to)
+        self._devices.append(dev)
         self.mark_topology_changed(f"add inductor: {name}")
 
     def add_C(
@@ -806,18 +987,16 @@ class EMTPSolver:
         C: float, Rp: Optional[float] = None,
     ) -> None:
         """添加电容(隐式梯形:G_eq = 2C/Δt)。支持字符串节点名。"""
+        self._ensure_unique_device_name(name, "capacitor")
         node_from = self._resolve_node(node_from)
         node_to = self._resolve_node(node_to)
         if C <= 0:
             raise ValueError(f"电容值必须为正: C={C}")
-        Geq_damping = 1.0 / Rp if Rp and Rp > 0 else 0.0
-        self.branches[name] = Branch(
-            name=name, element_type=ElementType.CAPACITOR,
-            node_from=node_from, node_to=node_to,
-            value=C, Geq=2.0 * C / self.dt,
-            Rp=Rp if Rp else 0.0, Geq_damping=Geq_damping,
-        )
+        dev = CapacitorDevice(name, node_from, node_to, C, self.dt,
+                              Rp=Rp if Rp else 0.0)
+        self.branches[name] = dev._branch
         self._update_node_count(node_from, node_to)
+        self._devices.append(dev)
         self.mark_topology_changed(f"add capacitor: {name}")
 
     def add_resistor(
@@ -873,6 +1052,7 @@ class EMTPSolver:
             G_eq = G_L / (1 + R * G_L)
             I_eq = I_L_hist / (1 + R * G_L)
         """
+        self._ensure_unique_device_name(name, "series RL branch")
         node_from = self._resolve_node(node_from)
         node_to = self._resolve_node(node_to)
         if R < 0:
@@ -880,18 +1060,10 @@ class EMTPSolver:
         if L <= 0:
             raise ValueError(f"电感值必须为正: L={L}")
 
-        G_L = self.dt / (2.0 * L)
-        denom = 1.0 + R * G_L
-        G_eq = G_L / denom
-
-        self.branches[name] = Branch(
-            name=name, element_type=ElementType.SERIES_RL,
-            node_from=node_from, node_to=node_to,
-            value=R, Geq=G_eq, Ihist=0.0,
-            params={'R': R, 'L': L, 'G_L': G_L, 'denom': denom},
-            state={'Ihist_L_raw': 0.0, 'v_L': 0.0},
-        )
+        dev = SeriesRLDevice(name, node_from, node_to, R, L, self.dt)
+        self.branches[name] = dev._branch
         self._update_node_count(node_from, node_to)
+        self._devices.append(dev)
         self.mark_topology_changed(f"add series RL: {name}")
 
     def add_SW(
@@ -902,23 +1074,17 @@ class EMTPSolver:
         initially_closed: bool = False,
     ) -> None:
         """添加定时开关。t_close / t_open < 0 表示不动作。支持字符串节点名。"""
+        self._ensure_unique_device_name(name, "switch")
+        if R_closed <= 0 or R_open <= 0:
+            raise ValueError("开关 R_closed/R_open 必须为正")
         node_from = self._resolve_node(node_from)
         node_to = self._resolve_node(node_to)
-        R_init = R_closed if initially_closed else R_open
-        self.branches[name] = Branch(
-            name=name, element_type=ElementType.SWITCH,
-            node_from=node_from, node_to=node_to,
-            value=R_init, Geq=1.0 / R_init,
-            is_closed=initially_closed,
-            R_closed=R_closed, R_open=R_open,
-            t_close=t_close, t_open=t_open,
-            state={
-                'initially_closed': bool(initially_closed),
-                'close_done': False,
-                'open_done': False,
-            },
-        )
+        dev = SwitchDevice(name, node_from, node_to,
+                           t_close, t_open, R_closed, R_open,
+                           bool(initially_closed))
+        self.branches[name] = dev._branch
         self._update_node_count(node_from, node_to)
+        self._devices.append(dev)
         self.mark_topology_changed(f"add switch: {name}")
 
     def add_switch(
@@ -945,6 +1111,7 @@ class EMTPSolver:
         current_func: Union[Callable[[float], float], float, LightningWaveform],
     ) -> None:
         """添加电流源,支持 LightningWaveform、常数或函数。支持字符串节点名。"""
+        self._ensure_unique_device_name(name, "current source")
         node_from = self._resolve_node(node_from)
         node_to = self._resolve_node(node_to)
         current_func = self._coerce_current_source_function(current_func)
@@ -975,18 +1142,27 @@ class EMTPSolver:
         sampling/evaluation helpers.  The EMTP solver only needs a scalar
         function of time, so we reconstruct it from the source's raw waveform,
         peak scale, Tstart and optional Tstop.
+
+        For the fallback path (no ``current_at`` method), a reusable scalar
+        buffer avoids allocating ``np.array([t_rel])`` on every time-step.
         """
+        # Prefer scalar fast path (avoids per-step np.array allocation).
+        if hasattr(source, "current_at_scalar"):
+            return lambda t, src=source: float(src.current_at_scalar(t))
         if hasattr(source, "current_at"):
             return lambda t, src=source: float(src.current_at(t))
 
-        def current_at(t: float, src=source) -> float:
+        _buf = np.empty(1, dtype=float)
+
+        def current_at(t: float, src=source, buf=_buf) -> float:
             t_rel = float(t) - float(getattr(src, "Tstart", 0.0))
             if t_rel < 0.0:
                 return 0.0
             tstop = getattr(src, "Tstop", None)
             if tstop is not None and float(t) > float(tstop):
                 return 0.0
-            raw = float(src._raw(np.array([t_rel], dtype=float))[0])
+            buf[0] = t_rel
+            raw = float(src._raw(buf)[0])
             return float(src.peak) * float(src.k_factor) * raw
         return current_at
 
@@ -1037,6 +1213,7 @@ class EMTPSolver:
         Returns the created ATP source object so callers can inspect parameters
         with get_info()/print_info().
         """
+        self._ensure_unique_device_name(name, "lightning current source")
         if create_lightning_current_source is None:
             raise ImportError(
                 "atp_lightning_current_generator_simplified.py is required for add_lightning_IS"
@@ -1048,6 +1225,32 @@ class EMTPSolver:
         )
         self.add_IS(name, node_from, node_to, source)
         return source
+
+    def add_lightning_current_source(
+        self,
+        name: str,
+        node_from: Union[str, int],
+        node_to: Union[str, int],
+        *,
+        model: str = "heidlerf",
+        peak: float,
+        T1: float,
+        T2: float,
+        n: float = 10.0,
+        PERC: int = 30,
+        Tstart: float = 0.0,
+        Tstop: Optional[float] = None,
+        atp_compatible: bool = True,
+        description: str = "",
+        **kwargs: Any,
+    ) -> Any:
+        """Recommended alias for :meth:`add_lightning_IS`."""
+        return self.add_lightning_IS(
+            name, node_from, node_to,
+            model=model, peak=peak, T1=T1, T2=T2, n=n, PERC=PERC,
+            Tstart=Tstart, Tstop=Tstop, atp_compatible=atp_compatible,
+            description=description, **kwargs,
+        )
 
     def add_standard_twoexpf_IS(
         self,
@@ -1064,6 +1267,7 @@ class EMTPSolver:
         description: str = "",
     ) -> Any:
         """Add a standard-library TWOEXPF lightning current source as IS."""
+        self._ensure_unique_device_name(name, "lightning current source")
         if create_standard_twoexpf_current_source is None:
             raise ImportError(
                 "atp_lightning_current_generator_simplified.py is required for add_standard_twoexpf_IS"
@@ -1075,6 +1279,28 @@ class EMTPSolver:
         )
         self.add_IS(name, node_from, node_to, source)
         return source
+
+    def add_standard_double_exponential_current_source(
+        self,
+        name: str,
+        node_from: Union[str, int],
+        node_to: Union[str, int],
+        *,
+        waveform_type: str,
+        peak: float,
+        PERC: int = 30,
+        Tstart: float = 0.0,
+        Tstop: Optional[float] = None,
+        atp_compatible: bool = True,
+        description: str = "",
+    ) -> Any:
+        """Recommended alias for :meth:`add_standard_twoexpf_IS`."""
+        return self.add_standard_twoexpf_IS(
+            name, node_from, node_to,
+            waveform_type=waveform_type, peak=peak, PERC=PERC,
+            Tstart=Tstart, Tstop=Tstop, atp_compatible=atp_compatible,
+            description=description,
+        )
 
     # =========================================================================
     # 理想电压源 (MNA 增广方程)
@@ -1096,10 +1322,13 @@ class EMTPSolver:
         ValueError
             node_pos <= 0 或节点已被其它电压源指定。
         """
+        self._ensure_unique_device_name(name, "voltage source")
         node_pos = self._resolve_node(node_pos)
         node_neg = self._resolve_node(node_neg)
         if node_pos <= 0:
             raise ValueError(f"电压源 {name} 正端必须 > 0,当前 {node_pos}")
+        if node_pos == node_neg:
+            raise ValueError(f"电压源 {name} 的正负端不能是同一节点")
         if node_pos in self._vs_node_set:
             raise ValueError(f"节点 {node_pos} 已被另一个电压源指定,不能重复")
         if node_neg > 0 and node_neg in self._vs_node_set:
@@ -1153,6 +1382,7 @@ class EMTPSolver:
             ...
             ENDFILE
         """
+        self._ensure_unique_device_name(name, "segmented MOA")
         node_from = self._resolve_node(node_from)
         node_to = self._resolve_node(node_to)
         model = SegmentedMOAResistor.from_file(
@@ -1171,17 +1401,16 @@ class EMTPSolver:
         model: SegmentedMOAResistor, Rp: float,
     ) -> None:
         """通用注册:构造 Branch + 写入 seg_helper + 更新节点。"""
+        self._ensure_unique_device_name(name, "segmented MOA")
         g_init, i_init = model.get_norton_equivalent(0)
-        self.branches[name] = Branch(
-            name=name, element_type=ElementType.NONLINEAR_RESISTOR,
-            node_from=node_from, node_to=node_to,
-            value=0.0, Geq=g_init, Ihist=i_init, Rp=Rp,
-            nonlinear_model=model,
-        )
+        dev = NonlinearResistorDevice(name, node_from, node_to,
+                                      g_init, i_init, model, Rp)
+        self.branches[name] = dev._branch
         self._update_node_count(node_from, node_to)
         self.seg_helper.register(name, model)
         self._seg_node_map[name] = (node_from, node_to)
         self._has_nonlinear = True
+        self._devices.append(dev)
         self.mark_topology_changed(f"add segmented nonlinear: {name}")
 
     # =========================================================================
@@ -1205,6 +1434,9 @@ class EMTPSolver:
         并联在绝缘子两端,间隙电压满足先导发展条件且先导桥接时闭合。
         CIGRE 速度公式: v(t) = k · u(t) · [ u(t)/(d-l) - E₀ ]
         """
+        self._ensure_unique_device_name(name, "LPM switch")
+        if R_arc <= 0 or R_open <= 0:
+            raise ValueError("LPM R_arc/R_open 必须为正")
         node_from = self._resolve_node(node_from)
         node_to = self._resolve_node(node_to)
         config = LPMConfig(
@@ -1218,21 +1450,10 @@ class EMTPSolver:
         )
         lpm_model = InsulatorFlashoverLPM(name, config)
 
-        # 开关型 Branch,初始开路
-        self.branches[name] = Branch(
-            name=name, element_type=ElementType.SWITCH,
-            node_from=node_from, node_to=node_to,
-            value=R_open, Geq=1.0 / R_open,
-            is_closed=False,
-            R_closed=R_arc, R_open=R_open,
-            t_close=-1.0, t_open=-1.0,
-            state={
-                'initially_closed': False,
-                'close_done': False,
-                'open_done': False,
-            },
-        )
+        dev = LPMFlashoverDevice(name, node_from, node_to, R_open, R_arc)
+        self.branches[name] = dev._branch
         self._update_node_count(node_from, node_to)
+        self._devices.append(dev)
         self.mark_topology_changed(f"add LPM switch: {name}")
 
         self._lpm_elements[name] = lpm_model
@@ -1246,62 +1467,50 @@ class EMTPSolver:
         )
         return lpm_model
 
+    def add_lpm_flashover_insulator(
+        self, name: str,
+        node_from: Union[str, int], node_to: Union[str, int],
+        gap_length: float,
+        k: float = 1.0e-6, E0: float = 600.0,
+        R_arc: float = 1.0, R_open: float = 1e9,
+        altitude_m: float = 0.0,
+        include_predischarge: bool = False,
+        allow_extinction: bool = False,
+        extinction_current: float = 0.0,
+        **kwargs,
+    ) -> Any:
+        """Recommended alias for :meth:`add_insulator_LPM`.
 
+        Adds a CIGRE leader-progression-model insulator flashover switch
+        in parallel with the insulator.  The gap flashes over when the
+        leader bridges the gap under the applied voltage.
 
-    def _update_lpm_states(self, V: np.ndarray) -> bool:
-        """更新所有 LPM 先导状态,返回是否有状态改变(需重解)。"""
-        if not self._lpm_elements:
-            return False
+        Parameters
+        ----------
+        gap_length : float
+            Insulator gap length in **metres**.
+        k : float
+            CIGRE velocity constant (m²/(kV²·s)).
+        E0 : float
+            Critical electric field in **kV/m**.
+        R_arc : float
+            Arc resistance in **ohms** after flashover.
+        R_open : float
+            Open-circuit resistance in **ohms** before flashover.
+        altitude_m : float
+            Altitude above sea level in **metres** (affects E0).
+        """
+        return self.add_insulator_LPM(
+            name, node_from, node_to,
+            gap_length=gap_length, k=k, E0=E0,
+            R_arc=R_arc, R_open=R_open,
+            altitude_m=altitude_m,
+            include_predischarge=include_predischarge,
+            allow_extinction=allow_extinction,
+            extinction_current=extinction_current,
+            **kwargs,
+        )
 
-        any_changed = False
-        for name, lpm in self._lpm_elements.items():
-            nf, nt = self._lpm_node_map[name]
-
-            v_branch = 0.0
-            if nf > 0:
-                v_branch += V[nf - 1]
-            if nt > 0:
-                v_branch -= V[nt - 1]
-
-            branch = self.branches[name]
-            # The flashover switch branch itself represents the arc path.
-            # Use the current MNA solution, not the previous step's Branch.current.
-            current_A = branch.Geq * v_branch
-
-            state_changed = lpm.update(
-                voltage_V=v_branch, dt=self.dt,
-                current_A=current_A, time=self.time,
-            )
-
-            if not state_changed:
-                continue
-
-            any_changed = True
-
-            if lpm.is_flashed_over:
-                branch.is_closed = True
-                branch.value = lpm.config.R_arc
-                branch.Geq = 1.0 / lpm.config.R_arc
-                self.mark_topology_changed(f"LPM flashover: {name}")
-
-                self._lpm_flashover_log.append({
-                    'name': name,
-                    'time': self.time,
-                    'time_us': self.time * 1e6,
-                    'voltage_kV': abs(v_branch) / 1e3,
-                    'leader_velocity': lpm.leader_velocity,
-                })
-                logger.info("绝缘子 %s 闪络: t=%.2fμs, V=%.1fkV",
-                            name, self.time * 1e6, abs(v_branch) / 1e3)
-            else:
-                branch.is_closed = False
-                branch.value = lpm.config.R_open
-                branch.Geq = 1.0 / lpm.config.R_open
-                self.mark_topology_changed(f"LPM extinction: {name}")
-                logger.info("绝缘子 %s 电弧熄灭: t=%.2fμs",
-                            name, self.time * 1e6)
-
-        return any_changed
 
     # ---- LPM 结果获取 ----
 
@@ -1522,6 +1731,7 @@ class EMTPSolver:
         self, name: str, data: 'UMECTransformerData',
     ) -> 'UMECTransformer':
         """添加 UMEC 变压器,按多端口邮票法入网。"""
+        self._ensure_unique_device_name(name, "UMEC transformer")
         if not UMEC_AVAILABLE:
             raise ImportError("UMEC 模块不可用,请确保 umec_transformer.py 可导入")
 
@@ -1678,6 +1888,7 @@ class EMTPSolver:
 
     def add_line(self, line: TransmissionLineInterface) -> None:
         """添加传输线(单相或多相)。"""
+        self._ensure_unique_device_name(line.name, "transmission line")
         if self.compile_lines_on_add:
             line.initialize(self.dt)
         else:
@@ -1722,6 +1933,7 @@ class EMTPSolver:
             端口节点。FitULM 数据为单相时传单个 int；
             FitULM 数据为多相时必须传长度等于相数 nc 的节点列表。
         """
+        self._ensure_unique_device_name(name, "ULM line")
         if not ULM_AVAILABLE:
             raise ImportError("ULM 模块不可用,请确保 ulm_transmission_line.py 可导入")
 
@@ -1745,11 +1957,7 @@ class EMTPSolver:
                     f"{len(nodes_k)} 个 k 端 / {len(nodes_m)} 个 m 端节点"
                 )
 
-            line = ULMLine.create_from_data(
-                name=name, node_k=nodes_k[0], node_m=nodes_m[0],
-                fit_data=fit_data, line_length=length, dt=self.dt,
-                verbose=self.verbose,
-            )
+            line = ULMLine(name, ulm_model, nodes_k[0], nodes_m[0])
             line.nodes_k = nodes_k
             line.nodes_m = nodes_m
         else:
@@ -1825,72 +2033,34 @@ class EMTPSolver:
     def _build_MNA_matrix(self) -> sp.csc_matrix:
         """构建 MNA 增广稀疏矩阵 (CSC 格式)。
 
-        矩阵结构 (n+m) × (n+m):
-            ┌       ┐
-            │ G   B │   G: n×n 节点导纳
-            │       │   B: n×m 电压源关联  (+1/-1)
-            │ C   0 │   C: m×n = Bᵀ
-            └       ┘
-
-        使用 COO 三元组装配,最后转 CSC 供 SuperLU 分解。
+        委托 StampingEngine 处理 devices + VS；传输线与变压器贡献
+        由 solver 在 begin/finish 之间插入。
         """
-        n = self.num_nodes
+        n = self._indexer.n
         if n == 0:
             raise ValueError("电路中没有节点")
 
-        # 建立有序电压源列表 (仅首次或电压源变化时)
         if self._vs_list is None:
             self._vs_list = list(self.voltage_sources.values())
             self._vs_index_map = {
                 vs.name: idx for idx, vs in enumerate(self._vs_list)
             }
 
-        m = len(self._vs_list)  # 电压源个数
-        N = n + m               # MNA 系统总维度
-        self._mna_size = N
+        m = len(self._vs_list)
+        self._mna_size = n + m
 
-        # COO 三元组
-        rows: List[int] = []
-        cols: List[int] = []
-        vals: List[float] = []
+        eng = self._stamping
+        stamper = eng.begin_G(n, m)
 
-        def _stamp_g(r: int, c: int, g: float) -> None:
-            """向 COO 添加一个导纳贡献。"""
-            rows.append(r); cols.append(c); vals.append(g)
+        # 1. branch devices
+        eng.stamp_devices_G(stamper, self._devices)
 
-        # ---- 1. 支路贡献 (G 矩阵, 左上 n×n) ----
-        for branch in self.branches.values():
-            nf, nt = branch.node_from, branch.node_to
-            et = branch.element_type
-
-            if et == ElementType.NONLINEAR_RESISTOR:
-                g_eq = branch.Geq
-            elif et == ElementType.RESISTOR:
-                g_eq = branch.Geq
-            elif et in (ElementType.INDUCTOR, ElementType.CAPACITOR):
-                g_eq = branch.Geq + branch.Geq_damping
-            elif et == ElementType.SERIES_RL:
-                g_eq = branch.Geq
-            elif et == ElementType.SWITCH:
-                g_eq = branch.Geq
-            else:
-                continue
-
-            if nf > 0:
-                _stamp_g(nf - 1, nf - 1, g_eq)
-            if nt > 0:
-                _stamp_g(nt - 1, nt - 1, g_eq)
-            if nf > 0 and nt > 0:
-                _stamp_g(nf - 1, nt - 1, -g_eq)
-                _stamp_g(nt - 1, nf - 1, -g_eq)
-
-        # ---- 2. 传输线贡献 ----
+        # 2. transmission lines (solver-owned, not yet device-ified)
         for line in self.transmission_lines.values():
             nk_list, nm_list = self._get_line_nodes(line)
             nc = len(nk_list)
             G_line = line.G_eq
 
-            # 规范为 nc × nc 矩阵
             if not isinstance(G_line, np.ndarray):
                 G_line = np.eye(nc) * G_line
             elif G_line.ndim == 1:
@@ -1904,54 +2074,45 @@ class EMTPSolver:
             for i, node_row in enumerate(nk_list):
                 if node_row <= 0:
                     continue
+                cr = self._indexer.to_compact(node_row)
                 for j, node_col in enumerate(nk_list):
                     if node_col > 0:
-                        _stamp_g(node_row - 1, node_col - 1, G_line[i, j])
+                        stamper.add(cr, self._indexer.to_compact(node_col), G_line[i, j])
             for i, node_row in enumerate(nm_list):
                 if node_row <= 0:
                     continue
+                cr = self._indexer.to_compact(node_row)
                 for j, node_col in enumerate(nm_list):
                     if node_col > 0:
-                        _stamp_g(node_row - 1, node_col - 1, G_line[i, j])
+                        stamper.add(cr, self._indexer.to_compact(node_col), G_line[i, j])
 
-        # ---- 3. UMEC 变压器贡献(多端口邮票法) ----
+        # 3. UMEC transformers
         for xfmr in self.transformers.values():
             G_tf, _ = xfmr.get_norton_equivalent()
             port_nodes = xfmr.get_port_nodes()
             mp = len(port_nodes)
             for i in range(mp):
                 nf_i, nt_i = port_nodes[i]
+                cf_i = self._indexer.to_compact(nf_i)
+                ct_i = self._indexer.to_compact(nt_i)
                 for j in range(mp):
                     nf_j, nt_j = port_nodes[j]
+                    cf_j = self._indexer.to_compact(nf_j)
+                    ct_j = self._indexer.to_compact(nt_j)
                     g = G_tf[i, j]
-                    if nf_i > 0 and nf_j > 0:
-                        _stamp_g(nf_i - 1, nf_j - 1, g)
-                    if nt_i > 0 and nt_j > 0:
-                        _stamp_g(nt_i - 1, nt_j - 1, g)
-                    if nf_i > 0 and nt_j > 0:
-                        _stamp_g(nf_i - 1, nt_j - 1, -g)
-                    if nt_i > 0 and nf_j > 0:
-                        _stamp_g(nt_i - 1, nf_j - 1, -g)
+                    if cf_i >= 0 and cf_j >= 0:
+                        stamper.add(cf_i, cf_j, g)
+                    if ct_i >= 0 and ct_j >= 0:
+                        stamper.add(ct_i, ct_j, g)
+                    if cf_i >= 0 and ct_j >= 0:
+                        stamper.add(cf_i, ct_j, -g)
+                    if ct_i >= 0 and cf_j >= 0:
+                        stamper.add(ct_i, cf_j, -g)
 
-        # ---- 4. 电压源 MNA 邮票 (B, C 矩阵) ----
-        for k, vs in enumerate(self._vs_list):
-            vs_row = n + k  # 增广行索引
+        # 4. voltage sources
+        eng.stamp_vs_G(stamper, self._vs_list)
 
-            # B 矩阵: G 矩阵右侧 n×m 块
-            # C 矩阵: G 矩阵下方 m×n 块 (C = Bᵀ)
-            if vs.node_pos > 0:
-                _stamp_g(vs.node_pos - 1, vs_row, 1.0)  # B[node_pos, k] = +1
-                _stamp_g(vs_row, vs.node_pos - 1, 1.0)  # C[k, node_pos] = +1
-            if vs.node_neg > 0:
-                _stamp_g(vs.node_neg - 1, vs_row, -1.0)  # B[node_neg, k] = -1
-                _stamp_g(vs_row, vs.node_neg - 1, -1.0)  # C[k, node_neg] = -1
-
-        # ---- 组装稀疏 CSC 矩阵 ----
-        MNA = sp.coo_matrix(
-            (vals, (rows, cols)), shape=(N, N),
-        ).tocsc()
-
-        return MNA
+        return eng.finish_G(stamper)
 
     def _build_MNA_rhs(self) -> np.ndarray:
         """构建 MNA 增广右端向量 [I; E]。
@@ -1959,7 +2120,7 @@ class EMTPSolver:
         opt3: 复用 RHS 缓冲区，并在 ULM batch 模式下直接从 batch 数组
         使用预编译索引表注入线路历史源，避免每步逐线 Python 对象遍历。
         """
-        n = self.num_nodes
+        n = self._indexer.n
         m = len(self._vs_list) if self._vs_list else 0
         N = n + m
 
@@ -1971,30 +2132,31 @@ class EMTPSolver:
             rhs.fill(0.0)
 
         # ---- 1. 支路历史源 ----
-        for branch in self.branches.values():
-            et = branch.element_type
-            if et == ElementType.NONLINEAR_RESISTOR:
-                i_eq = getattr(branch, 'Ihist', 0.0)
-            elif et in (ElementType.INDUCTOR, ElementType.CAPACITOR):
-                i_eq = branch.Ihist
-            elif et == ElementType.SERIES_RL:
-                i_eq = branch.Ihist
-            else:
-                continue
-
-            nf, nt = branch.node_from, branch.node_to
-            if nf > 0:
-                rhs[nf - 1] -= i_eq
-            if nt > 0:
-                rhs[nt - 1] += i_eq
+        for dev in self._devices:
+            dev.stamp_rhs(rhs, self._indexer, self.time)
 
         # ---- 2. 电流源 ----
-        for source in self.current_sources.values():
-            I_s = source.current_at(self.time)
-            if source.node_from > 0:
-                rhs[source.node_from - 1] -= I_s
-            if source.node_to > 0:
-                rhs[source.node_to - 1] += I_s
+        if self.pre_sample_sources and self._current_source_samples:
+            step_idx = int(round(self.time / self.dt))
+            for source in self.current_sources.values():
+                I_s = float(
+                    self._current_source_samples[source.name][step_idx]
+                )
+                cf = self._indexer.to_compact(source.node_from)
+                ct = self._indexer.to_compact(source.node_to)
+                if cf >= 0:
+                    rhs[cf] -= I_s
+                if ct >= 0:
+                    rhs[ct] += I_s
+        else:
+            for source in self.current_sources.values():
+                I_s = source.current_at(self.time)
+                cf = self._indexer.to_compact(source.node_from)
+                ct = self._indexer.to_compact(source.node_to)
+                if cf >= 0:
+                    rhs[cf] -= I_s
+                if ct >= 0:
+                    rhs[ct] += I_s
 
         # ---- 3. 传输线历史源 ----
         batch = getattr(self, '_ulm_batch', None)
@@ -2056,84 +2218,57 @@ class EMTPSolver:
             _, I_hist_tf = xfmr.get_norton_equivalent()
             port_nodes = xfmr.get_port_nodes()
             for i, (nf_i, nt_i) in enumerate(port_nodes):
-                if nf_i > 0:
-                    rhs[nf_i - 1] -= I_hist_tf[i]
-                if nt_i > 0:
-                    rhs[nt_i - 1] += I_hist_tf[i]
+                cf_i = self._indexer.to_compact(nf_i)
+                ct_i = self._indexer.to_compact(nt_i)
+                if cf_i >= 0:
+                    rhs[cf_i] -= I_hist_tf[i]
+                if ct_i >= 0:
+                    rhs[ct_i] += I_hist_tf[i]
 
         # ---- 5. 电压源激励 E ----
         if self._vs_list:
-            for k, vs in enumerate(self._vs_list):
-                rhs[n + k] = vs.voltage_at(self.time)
+            if self.pre_sample_sources and self._voltage_source_samples:
+                step_idx = int(round(self.time / self.dt))
+                for k, vs in enumerate(self._vs_list):
+                    rhs[n + k] = float(
+                        self._voltage_source_samples[vs.name][step_idx]
+                    )
+            else:
+                for k, vs in enumerate(self._vs_list):
+                    rhs[n + k] = vs.voltage_at(self.time)
 
         return rhs
 
     def _build_system_matrix(self) -> Tuple[sp.csc_matrix, np.ndarray]:
         """(MNA, rhs) 对:MNA 矩阵按脏位缓存,rhs 每步重建。"""
-        if self._G_dirty or self._cached_MNA is None:
-            self._cached_MNA = self._build_MNA_matrix()
-            self._G_dirty = False
-            self._cached_splu = None
+        eng = self._stamping
+        if eng.G_dirty or eng.cached_MNA is None:
+            self._build_MNA_matrix()  # side-effect: caches via eng.finish_G
+            self._cached_MNA = eng.cached_MNA
             self._stats['G_rebuilds'] = self._stats.get('G_rebuilds', 0) + 1
         else:
+            self._cached_MNA = eng.cached_MNA
             self._stats['G_cache_hits'] = self._stats.get('G_cache_hits', 0) + 1
-        return self._cached_MNA, self._build_MNA_rhs()
+
+        if self.use_rhs_plan and (self._rhs_plan_dirty or self._rhs_plan is None):
+            self._rhs_plan = self._compile_rhs_plan()
+            self._rhs_plan_dirty = False
+
+        rhs = (self._build_rhs_fast() if self.use_rhs_plan
+               else self._build_MNA_rhs())
+
+        return self._cached_MNA, rhs
 
     # =========================================================================
-    # MNA 稀疏求解 (KLU / SuperLU)
+    # MNA 稀疏求解 (SuperLU)
     # =========================================================================
 
     def _solve_mna(
         self, MNA: sp.csc_matrix, rhs: np.ndarray,
     ) -> np.ndarray:
-        """MNA 稀疏求解：固定使用 scipy.sparse.linalg.splu。
-
-        解向量 x = [v_1,...,v_n, i_vs1,...,i_vsm]。
-        前 n 个分量为节点电压；电压源电流从增广分量取反写回，
-        保持“正端→外部电路→负端”的原 API 符号约定。
-
-        说明
-        ----
-        本版本只支持 ``splu``：
-        - MNA 矩阵使用 CSC 稀疏格式；
-        - LU 分解结果按矩阵缓存，矩阵不变时复用；
-        - 默认矩阵奇异时直接报错；
-        - 显式启用 allow_singular_regularization 时才添加 gmin 正则项重试。
-        """
-        n = self.num_nodes
-        N = MNA.shape[0]
+        """MNA sparse solve - delegates to StampingEngine."""
         self._active_mna_solver_name = "SuperLU(splu)"
-
-        if self._cached_splu is None:
-            try:
-                self._cached_splu = _sparse_factorize(MNA)
-            except RuntimeError as exc:
-                if not self.allow_singular_regularization:
-                    raise RuntimeError(
-                        "MNA matrix is singular. Check floating nodes, missing "
-                        "ground reference, open circuits, ideal voltage-source "
-                        "loops, or disconnected subcircuits."
-                    ) from exc
-                # Debug fallback: add a tiny shunt only to the node-voltage block.
-                reg_diag = np.zeros(N, dtype=np.float64)
-                reg_diag[:n] = self._LU_SINGULAR_REG
-                reg = sp.diags(reg_diag, format='csc')
-                self._cached_splu = _sparse_factorize(MNA + reg)
-
-        try:
-            x = self._cached_splu.solve(rhs)
-        except (RuntimeError, ValueError) as exc:
-            raise RuntimeError("MNA sparse solve failed") from exc
-
-        V = x[:n]
-
-        if self._vs_list:
-            for k, vs in enumerate(self._vs_list):
-                # MNA augmented current x[n+k] enters the positive terminal of
-                # the ideal source. Public API reports delivered source current.
-                vs.current = -x[n + k]
-
-        return V
+        return self._stamping.solve(MNA, rhs, self._vs_list or [])
 
     # =========================================================================
     # 单步求解
@@ -2141,7 +2276,7 @@ class EMTPSolver:
 
     def _solve_segmented(self) -> np.ndarray:
         """PSCAD 分段线性法求解。"""
-        V = np.zeros(self.num_nodes)
+        V = np.zeros(self._indexer.n)
         converged = False
         for seg_iter in range(self._MAX_SEG_ITER):
             MNA, rhs = self._build_system_matrix()
@@ -2153,8 +2288,8 @@ class EMTPSolver:
 
             voltages = {}
             for name, (nf, nt) in self._seg_node_map.items():
-                v_i = V[nf - 1] if nf > 0 else 0.0
-                v_j = V[nt - 1] if nt > 0 else 0.0
+                v_i = V[self._indexer.to_compact(nf)] if nf > 0 else 0.0
+                v_j = V[self._indexer.to_compact(nt)] if nt > 0 else 0.0
                 voltages[name] = v_i - v_j
 
             need_resolve, updates = self.seg_helper.check_all_segments(voltages)
@@ -2188,161 +2323,40 @@ class EMTPSolver:
         return self._solve_mna(MNA, rhs)
 
     def _solve_step(self) -> np.ndarray:
-        """单步求解:必要时因 LPM 状态改变而重解。"""
-        V = self._solve_segmented() if self._has_nonlinear else self._solve_linear()
+        """Single-step solve with unified nonlinear/LPM/UMEC resolve loop."""
 
-        if self._lpm_elements and self._update_lpm_states(V):
-            self._stats['lpm_resolves'] = self._stats.get('lpm_resolves', 0) + 1
+        def _mark_dirty(reason: str) -> None:
+            self.mark_topology_changed(reason)
+
+        for resolve_round in range(self._MAX_SEG_ITER):
             V = (self._solve_segmented() if self._has_nonlinear
                  else self._solve_linear())
 
-        if self.transformers:
-            converged = False
-            for _ in range(self._MAX_SEG_ITER):
-                if not self._check_transformer_saturation(V):
-                    converged = True
-                    break
-                self._stats['transformer_saturation_resolves'] += 1
-                V = (self._solve_segmented() if self._has_nonlinear
-                     else self._solve_linear())
-            if not converged:
-                logger.warning(
-                    "UMEC saturation solver did not converge at t=%g after %d iterations",
-                    self.time,
-                    self._MAX_SEG_ITER,
-                )
+            if not self._runtime.post_solve_resolve_check(
+                V, self.time,
+                self._lpm_elements, self._lpm_node_map,
+                self.transformers,
+                self._seg_node_map, self.seg_helper,
+                self.branches, self._indexer,
+                _mark_dirty, self._stats,
+            ):
+                break
+
+            self._stats['segment_resolves'] = (
+                self._stats.get('segment_resolves', 0) + 1
+            )
+            if resolve_round + 1 > self._stats.get('max_seg_iter', 0):
+                self._stats['max_seg_iter'] = resolve_round + 1
+        else:
+            logger.warning(
+                "nonlinear/saturation solver did not converge at t=%g "
+                "after %d iterations", self.time, self._MAX_SEG_ITER,
+            )
         return V
 
     # =========================================================================
     # 状态更新
     # =========================================================================
-
-    def _update_switch_states(self) -> None:
-        """定时开关状态更新(跳过 LPM 控制的开关)。"""
-        if hasattr(self, '_has_timed_switches') and not self._has_timed_switches:
-            return
-        for name, branch in self.branches.items():
-            if branch.element_type != ElementType.SWITCH:
-                continue
-            if name in self._lpm_elements:
-                continue
-            branch.state.setdefault('close_done', False)
-            branch.state.setdefault('open_done', False)
-
-            if (
-                branch.t_close >= 0
-                and not branch.state.get('close_done', False)
-                and self.time >= branch.t_close
-            ):
-                if not branch.is_closed:
-                    branch.is_closed = True
-                    branch.value = branch.R_closed
-                    branch.Geq = 1.0 / branch.R_closed
-                    self.mark_topology_changed(f"switch close: {name}")
-                branch.state['close_done'] = True
-
-            if (
-                branch.t_open >= 0
-                and not branch.state.get('open_done', False)
-                and self.time >= branch.t_open
-            ):
-                if branch.is_closed:
-                    branch.is_closed = False
-                    branch.value = branch.R_open
-                    branch.Geq = 1.0 / branch.R_open
-                    self.mark_topology_changed(f"switch open: {name}")
-                branch.state['open_done'] = True
-
-    def _update_branch_quantities(self, V: np.ndarray,
-                                   step_idx: int = -1,
-                                   n_steps: int = 0) -> None:
-        """更新支路电压电流。
-
-        opt6:
-        - 默认 ``record_branch_history=False`` 时，不再为纯 R / 理想开关支路
-          每步写 Branch 对象与历史缓冲区；这些量不参与后续求解。
-        - L/C 仍必须更新 branch.voltage，因为历史源递推依赖它。
-        - 非线性电阻仍更新，方便分段/后处理路径保持一致。
-        """
-        record = bool(getattr(self, 'record_branch_history', False))
-        use_buf = (
-            record and step_idx >= 0 and step_idx < n_steps
-            and hasattr(self, '_branch_v_bufs')
-        )
-
-        for name, branch in self.branches.items():
-            et = branch.element_type
-
-            # 若不记录支路历史，纯电阻和普通开关的电压/电流只用于后处理；
-            # MNA 求解已通过导纳矩阵完成，不需要每步更新对象字段。
-            if not record and et in (ElementType.RESISTOR, ElementType.SWITCH):
-                continue
-
-            V_branch = 0.0
-            if branch.node_from > 0:
-                V_branch += V[branch.node_from - 1]
-            if branch.node_to > 0:
-                V_branch -= V[branch.node_to - 1]
-
-            branch.voltage_prev = branch.voltage
-            branch.voltage = V_branch
-            branch.current_prev = branch.current
-
-            if et == ElementType.RESISTOR:
-                branch.current = V_branch / branch.value
-            elif et in (ElementType.INDUCTOR, ElementType.CAPACITOR):
-                branch.current = (
-                    (branch.Geq + branch.Geq_damping) * V_branch
-                    + branch.Ihist
-                )
-            elif et == ElementType.SERIES_RL:
-                branch.current = branch.Geq * V_branch + branch.Ihist
-            elif et == ElementType.SWITCH:
-                branch.current = V_branch * branch.Geq
-            elif et == ElementType.NONLINEAR_RESISTOR:
-                if branch.nonlinear_model is not None:
-                    branch.current = branch.nonlinear_model.get_current(V_branch)
-                else:
-                    branch.current = V_branch * branch.Geq + branch.Ihist
-
-            if use_buf:
-                self._branch_v_bufs[name][step_idx] = branch.voltage
-                self._branch_i_bufs[name][step_idx] = branch.current
-            elif record:
-                branch.voltage_history.append(branch.voltage)
-                branch.current_history.append(branch.current)
-
-    def _update_history_sources(self) -> None:
-        """隐式梯形历史源更新。"""
-        for branch in self.branches.values():
-            et = branch.element_type
-            if et == ElementType.INDUCTOR:
-                branch.Ihist = branch.Ihist + 2.0 * branch.Geq * branch.voltage
-            elif et == ElementType.CAPACITOR:
-                branch.Ihist = -branch.Ihist - 2.0 * branch.Geq * branch.voltage
-            elif et == ElementType.SERIES_RL:
-                self._update_series_rl_history(branch)
-
-    def _update_series_rl_history(self, branch: Branch) -> None:
-        """更新无中间节点串联 RL 二端支路的历史源。"""
-        p = branch.params
-        s = branch.state
-        R = p['R']
-        G_L = p['G_L']
-        denom = p['denom']
-
-        i = branch.current
-        v_branch = branch.voltage
-        v_L = v_branch - R * i
-
-        hist_raw_old = s.get('Ihist_L_raw', 0.0)
-        hist_raw_new = hist_raw_old + 2.0 * G_L * v_L
-
-        s['v_L'] = v_L
-        s['Ihist_L_raw'] = hist_raw_new
-
-        # branch.Ihist 保存的是合并到二端 Norton 支路后的等效历史源。
-        branch.Ihist = hist_raw_new / denom
 
     def _update_source_history(self) -> None:
         if not getattr(self, 'record_source_history', False):
@@ -2433,30 +2447,537 @@ class EMTPSolver:
         port_nodes = xfmr.get_port_nodes()
         V_ports = np.zeros(xfmr.m)
         for k, (nf, nt) in enumerate(port_nodes):
-            v_f = V[nf - 1] if nf > 0 else 0.0
-            v_t = V[nt - 1] if nt > 0 else 0.0
+            v_f = V[self._indexer.to_compact(nf)] if nf > 0 else 0.0
+            v_t = V[self._indexer.to_compact(nt)] if nt > 0 else 0.0
             V_ports[k] = v_f - v_t
         return V_ports
 
-    def _check_transformer_saturation(self, V: np.ndarray) -> bool:
-        """Check UMEC saturation segment changes and invalidate MNA if needed."""
-        changed = False
-        for name, xfmr in self.transformers.items():
-            if not hasattr(xfmr, 'check_saturation'):
-                continue
-            V_ports = self._get_transformer_port_voltages(xfmr, V)
-            need_update, updates = xfmr.check_saturation(V_ports)
-            if need_update:
-                changed = True
-                self._stats['transformer_saturation_switches'] += len(updates)
-                self.mark_topology_changed(
-                    f"UMEC saturation segment changed: {name}"
-                )
-        return changed
+    def _is_empty_circuit(self) -> bool:
+        return (
+            not self.branches
+            and not self.current_sources
+            and not self.voltage_sources
+            and not self.transmission_lines
+            and not self.transformers
+        )
 
-    # =========================================================================
-    # 主仿真循环
-    # =========================================================================
+    def estimate_result_memory_bytes(self) -> int:
+        """Estimate result buffer memory usage in bytes before running.
+
+        Covers the main arrays allocated during ``run()``: time vector, node
+        voltage history (if enabled), probes, line/branch history buffers,
+        and source current history.  The estimate assumes float64 storage.
+        """
+        n_steps = int(round(self.finish_time / self.dt)) + 1
+        F64 = 8
+
+        total = n_steps * F64  # time_array
+
+        if self.record_all_node_voltages:
+            total += self._indexer.n * n_steps * F64
+
+        n_vp = len(self.voltage_probes)
+        if n_vp:
+            total += n_vp * n_steps * F64
+
+        n_bcp = len(self.branch_current_probes)
+        if n_bcp:
+            total += n_bcp * n_steps * F64
+
+        if self.record_line_history:
+            for line in self.transmission_lines.values():
+                nk_list, _ = self._get_line_nodes(line)
+                nc = len(nk_list)
+                total += 4 * nc * n_steps * F64  # Ik, Im, Vk, Vm
+
+        if self.record_branch_history:
+            total += 2 * len(self.branches) * n_steps * F64  # V, I
+
+        if self.record_source_history:
+            total += len(self.voltage_sources) * n_steps * F64
+
+        return total
+
+    def _pre_sample_sources(self, n_steps: int) -> None:
+        """Pre-sample independent sources on the simulation time grid.
+
+        When ``pre_sample_sources`` is enabled, scalar source functions are
+        evaluated once for the entire grid and stored in flat arrays.  This
+        removes per-step Python function-call overhead at the cost of
+        evaluating all sources upfront.
+
+        .. note::
+           Pre-sampling changes the *timing* of source function evaluation.
+           Users whose callables depend on external state should keep
+           ``pre_sample_sources=False``.
+        """
+        self._current_source_samples.clear()
+        self._voltage_source_samples.clear()
+
+        t_arr = np.arange(n_steps, dtype=np.float64) * self.dt
+
+        if self.current_sources:
+            for name, src in self.current_sources.items():
+                self._current_source_samples[name] = np.array(
+                    [src.current_at(float(ti)) for ti in t_arr],
+                    dtype=np.float64,
+                )
+
+        if self.voltage_sources:
+            for name, vs in self.voltage_sources.items():
+                self._voltage_source_samples[name] = np.array(
+                    [vs.voltage_at(float(ti)) for ti in t_arr],
+                    dtype=np.float64,
+                )
+
+    def _compile_rhs_plan(self) -> RHSPlan:
+        """Pre-compile topological index arrays for fast RHS assembly.
+
+        Builds flat arrays of node indices for reactive branches,
+        current sources, and transformer ports so the per-step RHS
+        construction avoids iterating Python device objects.
+        """
+        plan = RHSPlan()
+
+        # ---- reactive branch history sources ----
+        dyn_names = []
+        dyn_nf = []
+        dyn_nt = []
+        dyn_types = []
+        for name, branch in self.branches.items():
+            et = branch.element_type
+            if et in (ElementType.INDUCTOR, ElementType.CAPACITOR,
+                       ElementType.SERIES_RL, ElementType.NONLINEAR_RESISTOR):
+                dyn_names.append(name)
+                dyn_nf.append(self._indexer.to_compact(branch.node_from))
+                dyn_nt.append(self._indexer.to_compact(branch.node_to))
+                if et == ElementType.NONLINEAR_RESISTOR:
+                    dyn_types.append("NR")
+                elif et == ElementType.SERIES_RL:
+                    dyn_types.append("SRL")
+                else:
+                    dyn_types.append("LC")
+            # R, SW have no Ihist — skip
+
+        plan.dyn_branch_names = dyn_names
+        plan.dyn_branch_nf_idx = np.array(dyn_nf, dtype=int)
+        plan.dyn_branch_nt_idx = np.array(dyn_nt, dtype=int)
+        plan.dyn_branch_type = dyn_types
+
+        # ---- current sources ----
+        is_names = []
+        is_nf = []
+        is_nt = []
+        for name, source in self.current_sources.items():
+            is_names.append(name)
+            is_nf.append(self._indexer.to_compact(source.node_from))
+            is_nt.append(self._indexer.to_compact(source.node_to))
+
+        plan.isource_names = is_names
+        plan.isource_nf_idx = np.array(is_nf, dtype=int)
+        plan.isource_nt_idx = np.array(is_nt, dtype=int)
+
+        # ---- transformer ports ----
+        for name, xfmr in self.transformers.items():
+            plan.xfmr_names.append(name)
+            port_nodes = xfmr.get_port_nodes()
+            nf_arr = np.array([self._indexer.to_compact(nf) for nf, _ in port_nodes],
+                              dtype=int)
+            nt_arr = np.array([self._indexer.to_compact(nt) for _, nt in port_nodes],
+                              dtype=int)
+            plan.xfmr_port_nf_idx.append(nf_arr)
+            plan.xfmr_port_nt_idx.append(nt_arr)
+
+        return plan
+
+    def _build_rhs_fast(self) -> np.ndarray:
+        """Build the MNA RHS vector using the pre-compiled RHSPlan.
+
+        This path avoids iterating Python device objects; it walks flat
+        index arrays and looks up scalar values directly.
+        """
+        n = self._indexer.n
+        m = len(self._vs_list) if self._vs_list else 0
+        N = n + m
+        plan = self._rhs_plan
+
+        rhs = getattr(self, '_rhs_buf', None)
+        if rhs is None or rhs.shape[0] != N:
+            rhs = np.zeros(N, dtype=np.float64)
+            self._rhs_buf = rhs
+        else:
+            rhs.fill(0.0)
+
+        # ---- 1. 支路历史源 (flat index arrays) ----
+        n_dyn = len(plan.dyn_branch_names)
+        for k in range(n_dyn):
+            br = self.branches[plan.dyn_branch_names[k]]
+            if plan.dyn_branch_type[k] == "NR":
+                i_eq = getattr(br, 'Ihist', 0.0)
+            else:
+                i_eq = br.Ihist
+            if i_eq == 0.0:
+                continue
+            nf_idx = plan.dyn_branch_nf_idx[k]
+            nt_idx = plan.dyn_branch_nt_idx[k]
+            if nf_idx >= 0:
+                rhs[nf_idx] -= i_eq
+            if nt_idx >= 0:
+                rhs[nt_idx] += i_eq
+
+        # ---- 2. 电流源 ----
+        if self.pre_sample_sources and self._current_source_samples:
+            step_idx = int(round(self.time / self.dt))
+            n_is = len(plan.isource_names)
+            for k in range(n_is):
+                I_s = float(
+                    self._current_source_samples[plan.isource_names[k]][step_idx]
+                )
+                if I_s == 0.0:
+                    continue
+                nf_idx = plan.isource_nf_idx[k]
+                nt_idx = plan.isource_nt_idx[k]
+                if nf_idx >= 0:
+                    rhs[nf_idx] -= I_s
+                if nt_idx >= 0:
+                    rhs[nt_idx] += I_s
+        else:
+            n_is = len(plan.isource_names)
+            for k in range(n_is):
+                source = self.current_sources[plan.isource_names[k]]
+                I_s = source.current_at(self.time)
+                if I_s == 0.0:
+                    continue
+                nf_idx = plan.isource_nf_idx[k]
+                nt_idx = plan.isource_nt_idx[k]
+                if nf_idx >= 0:
+                    rhs[nf_idx] -= I_s
+                if nt_idx >= 0:
+                    rhs[nt_idx] += I_s
+
+        # ---- 3. 传输线历史源 (reuse existing ULM batch path) ----
+        batch = getattr(self, '_ulm_batch', None)
+        if batch is not None and self._ulm_batch_k_nodes_v is not None:
+            if self._ulm_batch_k_nodes_v.size:
+                np.add.at(
+                    rhs, self._ulm_batch_k_nodes_v,
+                    -batch.I_hist_k_batch[
+                        self._ulm_batch_k_rows_v, self._ulm_batch_k_slots_v,
+                    ],
+                )
+            if self._ulm_batch_m_nodes_v.size:
+                np.add.at(
+                    rhs, self._ulm_batch_m_nodes_v,
+                    -batch.I_hist_m_batch[
+                        self._ulm_batch_m_rows_v, self._ulm_batch_m_slots_v,
+                    ],
+                )
+            line_iter = getattr(self, '_line_inject_maps_nonbatch', [])
+        else:
+            line_iter = getattr(self, '_line_inject_maps', [])
+
+        for line, k_idx, m_idx, nc, _is_multi, _has_full in line_iter:
+            I_hist_k, I_hist_m = self._get_line_history_sources(line)
+            arr = np.asarray(I_hist_k)
+            if arr.ndim == 0:
+                if nc == 1 and k_idx[0] >= 0:
+                    rhs[k_idx[0]] -= float(np.real(arr))
+            else:
+                vals = arr.real.ravel()
+                limit = min(nc, len(k_idx), len(vals))
+                for i in range(limit):
+                    if k_idx[i] >= 0:
+                        rhs[k_idx[i]] -= float(vals[i])
+            arr = np.asarray(I_hist_m)
+            if arr.ndim == 0:
+                if nc == 1 and m_idx[0] >= 0:
+                    rhs[m_idx[0]] -= float(np.real(arr))
+            else:
+                vals = arr.real.ravel()
+                limit = min(nc, len(m_idx), len(vals))
+                for i in range(limit):
+                    if m_idx[i] >= 0:
+                        rhs[m_idx[i]] -= float(vals[i])
+
+        # ---- 4. UMEC 变压器历史源 (flat index arrays) ----
+        for x_idx, name in enumerate(plan.xfmr_names):
+            xfmr = self.transformers[name]
+            _, I_hist_tf = xfmr.get_norton_equivalent()
+            nf_arr = plan.xfmr_port_nf_idx[x_idx]
+            nt_arr = plan.xfmr_port_nt_idx[x_idx]
+            for i in range(len(nf_arr)):
+                if nf_arr[i] >= 0:
+                    rhs[nf_arr[i]] -= I_hist_tf[i]
+                if nt_arr[i] >= 0:
+                    rhs[nt_arr[i]] += I_hist_tf[i]
+
+        # ---- 5. 电压源激励 E ----
+        if self._vs_list:
+            if self.pre_sample_sources and self._voltage_source_samples:
+                step_idx = int(round(self.time / self.dt))
+                for k, vs in enumerate(self._vs_list):
+                    rhs[n + k] = float(
+                        self._voltage_source_samples[vs.name][step_idx]
+                    )
+            else:
+                for k, vs in enumerate(self._vs_list):
+                    rhs[n + k] = vs.voltage_at(self.time)
+
+        return rhs
+
+    def validate_probes(self) -> None:
+        """Validate probe references without mutating circuit topology."""
+        for name, probe in self.voltage_probes.items():
+            for key in ("node_pos", "node_neg"):
+                node = int(probe[key])
+                if node > 0 and node not in self._node_set:
+                    raise ValueError(
+                        f"电压探针 {name!r} 引用的节点 {node} 不存在"
+                    )
+
+        for name, probe in self.branch_current_probes.items():
+            branch_name = probe["branch_name"]
+            if branch_name not in self.branches:
+                raise ValueError(
+                    f"支路电流探针 {name!r} 引用的支路不存在: {branch_name}"
+                )
+
+    def validate_circuit(self, strict: bool = True) -> ValidationReport:
+        """Run topology and parameter checks before time stepping.
+
+        Parameters
+        ----------
+        strict : bool
+            If True (default), raise RuntimeError when errors are found.
+            If False, return the ValidationReport without raising.
+
+        Returns
+        -------
+        ValidationReport
+            Collected issues with severity levels.
+        """
+        issues: List[ValidationIssue] = []
+
+        def _add(severity: str, code: str, message: str,
+                 nodes=None, branches=None) -> None:
+            issues.append(ValidationIssue(
+                severity=severity, code=code, message=message,
+                related_nodes=nodes or [], related_branches=branches or [],
+            ))
+
+        # ---- 1. basic parameter checks (must pass before everything else) ----
+        if self.dt <= 0:
+            _add("error", "E001", f"dt 必须为正,当前为 {self.dt}")
+        if self.finish_time < 0:
+            _add("error", "E002",
+                 f"finish_time 不能为负,当前为 {self.finish_time}")
+
+        # Basic param errors prevent memory estimation and topology checks.
+        if any(i.severity == "error" for i in issues):
+            return self._finalize_validation(issues, strict)
+
+        # ---- 2. probe validation ----
+        for name, probe in self.voltage_probes.items():
+            for key in ("node_pos", "node_neg"):
+                node = int(probe[key])
+                if node > 0 and node not in self._node_set:
+                    _add("error", "E003",
+                         f"电压探针 {name!r} 引用的节点 {node} 不存在",
+                         nodes=[node])
+        for name, probe in self.branch_current_probes.items():
+            branch_name = probe["branch_name"]
+            if branch_name not in self.branches:
+                _add("error", "E004",
+                     f"支路电流探针 {name!r} 引用的支路不存在: {branch_name}",
+                     branches=[branch_name])
+
+        # ---- 3. empty / node-less circuits ----
+        if self._is_empty_circuit():
+            return self._finalize_validation(issues, strict)
+
+        if self._indexer.n <= 0:
+            _add("error", "E005", "电路中没有非地节点")
+            return self._finalize_validation(issues, strict)
+
+        # ---- 4. memory warnings (dt is now guaranteed positive) ----
+        max_ext_id = max(self._node_set) if self._node_set else 0
+        if max_ext_id > 10 * len(self._node_set):
+            _add("warning", "W001",
+                 f"Sparse external integer node IDs detected "
+                 f"(max={max_ext_id}, unique={len(self._node_set)}). "
+                 "NodeIndexer compacts external IDs, so MNA size is not increased, "
+                 "but sparse IDs can make models harder to read and debug. "
+                 "Consider using named nodes or compact external numbering.",
+                 nodes=[max_ext_id])
+
+        mem_bytes = self.estimate_result_memory_bytes()
+        if self.record_all_node_voltages and self._indexer.n > 0:
+            n_steps = int(round(self.finish_time / self.dt)) + 1
+            _add("info", "I001",
+                 f"record_all_node_voltages=True will allocate "
+                 f"{self._indexer.n}×{n_steps} voltage matrix "
+                 f"(~{mem_bytes / 1e6:.1f} MB). "
+                 "For large networks, set record_all_node_voltages=False "
+                 "and use probes instead.")
+        if (self.max_result_memory_mb is not None
+                and mem_bytes > self.max_result_memory_mb * 1e6):
+            _add("warning", "W002",
+                 f"Estimated result memory {mem_bytes / 1e6:.1f} MB exceeds "
+                 f"limit {self.max_result_memory_mb} MB. "
+                 "Disable record_all_node_voltages or reduce probes.")
+
+        # ---- 5. branch-level checks ----
+        adjacency: Dict[int, set] = {
+            int(n): set() for n in self._node_set if n > 0
+        }
+        grounded: set = set()
+
+        vs_parent: Dict[int, int] = {}
+
+        def vs_find(node: int) -> int:
+            node = int(node)
+            vs_parent.setdefault(node, node)
+            while vs_parent[node] != node:
+                vs_parent[node] = vs_parent[vs_parent[node]]
+                node = vs_parent[node]
+            return node
+
+        def vs_union(nf: int, nt: int, source_name: str) -> None:
+            root_f = vs_find(nf)
+            root_t = vs_find(nt)
+            if root_f == root_t:
+                _add("error", "E006",
+                     "Ideal voltage-source loop detected while adding "
+                     f"{source_name!r}. Break the loop with impedance or "
+                     "replace part of it with an equivalent source.",
+                     branches=[source_name])
+            else:
+                vs_parent[root_t] = root_f
+
+        def add_matrix_edge(nf: int, nt: int) -> None:
+            nf = int(nf)
+            nt = int(nt)
+            if nf > 0:
+                adjacency.setdefault(nf, set())
+            if nt > 0:
+                adjacency.setdefault(nt, set())
+            if nf > 0 and nt > 0:
+                adjacency[nf].add(nt)
+                adjacency[nt].add(nf)
+            elif nf > 0:
+                grounded.add(nf)
+            elif nt > 0:
+                grounded.add(nt)
+
+        for branch in self.branches.values():
+            if branch.node_from == branch.node_to:
+                _add("error", "E007",
+                     f"支路 {branch.name} 的两端不能是同一节点: "
+                     f"{branch.node_from}",
+                     nodes=[branch.node_from], branches=[branch.name])
+            if branch.element_type == ElementType.RESISTOR and branch.value <= 0:
+                _add("error", "E008",
+                     f"电阻 {branch.name} 的 R 必须为正",
+                     branches=[branch.name])
+            if branch.element_type == ElementType.INDUCTOR and branch.value <= 0:
+                _add("error", "E009",
+                     f"电感 {branch.name} 的 L 必须为正",
+                     branches=[branch.name])
+            if branch.element_type == ElementType.CAPACITOR and branch.value <= 0:
+                _add("error", "E010",
+                     f"电容 {branch.name} 的 C 必须为正",
+                     branches=[branch.name])
+            if branch.element_type == ElementType.SWITCH:
+                if branch.R_closed <= 0 or branch.R_open <= 0:
+                    _add("error", "E011",
+                         f"开关 {branch.name} 的 R_closed/R_open 必须为正",
+                         branches=[branch.name])
+            if branch.element_type in (
+                ElementType.RESISTOR,
+                ElementType.INDUCTOR,
+                ElementType.CAPACITOR,
+                ElementType.SERIES_RL,
+                ElementType.SWITCH,
+                ElementType.NONLINEAR_RESISTOR,
+            ):
+                add_matrix_edge(branch.node_from, branch.node_to)
+
+        # ---- 6. voltage source checks (loop detection via union-find) ----
+        for vs in self.voltage_sources.values():
+            if vs.node_pos == vs.node_neg:
+                _add("error", "E012",
+                     f"电压源 {vs.name} 的正负端不能是同一节点",
+                     branches=[vs.name])
+            vs_union(vs.node_pos, vs.node_neg, vs.name)
+            add_matrix_edge(vs.node_pos, vs.node_neg)
+
+        # ---- 7. transmission line nodes ----
+        for line in self.transmission_lines.values():
+            nk_list, nm_list = self._get_line_nodes(line)
+            for node in list(nk_list) + list(nm_list):
+                if node > 0:
+                    adjacency.setdefault(int(node), set())
+                    grounded.add(int(node))
+
+        # ---- 8. transformer port nodes ----
+        for xfmr in self.transformers.values():
+            for nf, nt in xfmr.get_port_nodes():
+                add_matrix_edge(nf, nt)
+
+        # ---- 9. current source nodes (track for floating-node diagnostics) ----
+        for source in self.current_sources.values():
+            if source.node_from > 0:
+                adjacency.setdefault(int(source.node_from), set())
+            if source.node_to > 0:
+                adjacency.setdefault(int(source.node_to), set())
+
+        # ---- 10. floating component detection ----
+        visited = set()
+        floating_components = []
+        for start in sorted(adjacency):
+            if start in visited:
+                continue
+            stack = [start]
+            component = set()
+            is_grounded = False
+            while stack:
+                node = stack.pop()
+                if node in visited:
+                    continue
+                visited.add(node)
+                component.add(node)
+                if node in grounded:
+                    is_grounded = True
+                for nxt in adjacency.get(node, ()):
+                    if nxt not in visited:
+                        stack.append(nxt)
+            if not is_grounded:
+                floating_components.append(sorted(component))
+
+        if floating_components:
+            _add("error", "E013",
+                 "Circuit has floating node groups without a ground reference: "
+                 f"{floating_components}. Add a ground reference, shunt path, "
+                 "or explicitly inspect the topology.",
+                 nodes=[n for grp in floating_components for n in grp])
+
+        return self._finalize_validation(issues, strict)
+
+    @staticmethod
+    def _finalize_validation(
+        issues: List[ValidationIssue], strict: bool,
+    ) -> ValidationReport:
+        """Build a ValidationReport and optionally raise on errors."""
+        report = ValidationReport(issues=issues)
+        if strict and report.has_errors:
+            error_msgs = "\n".join(
+                f"[{i.code}] {i.message}" for i in report.errors()
+            )
+            raise RuntimeError(
+                f"Circuit validation failed with {len(report.errors())} "
+                f"error(s):\n{error_msgs}"
+            )
+        return report
 
     def reset_dynamic_state(self) -> None:
         """Reset all time-domain device state before a fresh run()."""
@@ -2466,34 +2987,8 @@ class EMTPSolver:
         self.voltage_results = {}
         self._actual_steps = 0
 
-        for branch in self.branches.values():
-            branch.current = 0.0
-            branch.voltage = 0.0
-            branch.current_prev = 0.0
-            branch.voltage_prev = 0.0
-            branch.current_history.clear()
-            branch.voltage_history.clear()
-
-            if branch.element_type in (
-                ElementType.INDUCTOR,
-                ElementType.CAPACITOR,
-                ElementType.SERIES_RL,
-            ):
-                branch.Ihist = 0.0
-
-            if branch.element_type == ElementType.SERIES_RL:
-                branch.state['Ihist_L_raw'] = 0.0
-                branch.state['v_L'] = 0.0
-
-            if branch.element_type == ElementType.SWITCH:
-                initially_closed = bool(
-                    branch.state.get('initially_closed', branch.is_closed)
-                )
-                branch.state['close_done'] = False
-                branch.state['open_done'] = False
-                branch.is_closed = initially_closed
-                branch.value = branch.R_closed if initially_closed else branch.R_open
-                branch.Geq = 1.0 / branch.value
+        for dev in self._devices:
+            dev.reset_state()
 
         self.seg_helper.reset_all()
         for name, model in getattr(self.seg_helper, 'elements', {}).items():
@@ -2506,15 +3001,6 @@ class EMTPSolver:
 
         for name, lpm in self._lpm_elements.items():
             lpm.reset()
-            if name not in self.branches:
-                continue
-            branch = self.branches[name]
-            branch.is_closed = False
-            branch.value = lpm.config.R_open
-            branch.Geq = 1.0 / lpm.config.R_open
-            branch.state['initially_closed'] = False
-            branch.state['close_done'] = False
-            branch.state['open_done'] = False
         self._lpm_flashover_log.clear()
 
         for source in self.current_sources.values():
@@ -2543,20 +3029,28 @@ class EMTPSolver:
         self._ulm_batch_line_index = {}
 
     def run(self) -> None:
-        """运行仿真（含预编译优化与计时探针）。"""
+        """运行仿真（含预编译优化与计时探针）。
+
+        Switch events are evaluated on the fixed simulation grid.
+        An event scheduled at ``t_event`` is applied at the first
+        step satisfying ``t >= t_event``, i.e. the effective event
+        time is ``ceil(t_event / dt) * dt``.
+        """
         _t = _perf_time.perf_counter
         t_run_start = _t()
 
-        if self.dt <= 0:
-            raise ValueError(f"dt 必须为正,当前为 {self.dt}")
-        if self.finish_time < 0:
-            raise ValueError(f"finish_time 不能为负,当前为 {self.finish_time}")
+        report = self.validate_circuit()
+
+        if self.verbose and report.has_warnings:
+            for w in report.warnings():
+                logger.warning("[%s] %s", w.code, w.message)
 
         # 重置求解器和所有动态元件状态，保证同一个 solver 可重复 run()。
         self._stats = self._fresh_stats()
         self._timing = defaultdict(float)
         self.reset_dynamic_state()
         self._reset_caches()
+        self._is_running = True
 
         if self.verbose:
             self._log_run_header()
@@ -2564,11 +3058,35 @@ class EMTPSolver:
         # 预分配输出
         n_steps = int(round(self.finish_time / self.dt)) + 1
         self._time_array_buf = np.zeros(n_steps)
-        self._voltage_buf = np.zeros((self.num_nodes, n_steps))
+        self._voltage_buf = (
+            np.zeros((self._indexer.n, n_steps))
+            if self.record_all_node_voltages
+            else None
+        )
         self._vs_current_bufs: Dict[str, np.ndarray] = (
             {name: np.zeros(n_steps) for name in self.voltage_sources}
             if self.record_source_history else {}
         )
+
+        # Empty circuits are useful as a timing-grid smoke test and should not
+        # enter MNA assembly, where there is intentionally no matrix to solve.
+        if self._is_empty_circuit():
+            self._init_probe_storage(n_steps)
+            self._time_array_buf[:] = np.arange(n_steps, dtype=np.float64) * self.dt
+            self._actual_steps = n_steps
+            self.step_count = n_steps
+            self.time = self._time_array_buf[-1] if n_steps else 0.0
+            self.time_array = self._time_array_buf
+            self.voltage_results = {}
+            self._stats['total_steps'] = n_steps
+            self._timing['init'] = _t() - t_run_start
+            self._timing['run_total'] = self._timing['init']
+            self._results_valid = True
+            if self.verbose:
+                self.print_timing_report()
+                logger.info("空电路仿真完成,共 %d 步", self.step_count)
+                self.print_solver_statistics()
+            return
 
         # ---- 预编译传输线注入映射 (6-tuple) ----
         self._line_inject_maps = []
@@ -2581,8 +3099,8 @@ class EMTPSolver:
             is_multi = self._is_multiphase_line(line)
             has_full = hasattr(line, 'full_step')
 
-            k_idx = np.array([n - 1 if n > 0 else -1 for n in nk_list], dtype=int)
-            m_idx = np.array([n - 1 if n > 0 else -1 for n in nm_list], dtype=int)
+            k_idx = np.array([self._indexer.to_compact(n) for n in nk_list], dtype=int)
+            m_idx = np.array([self._indexer.to_compact(n) for n in nm_list], dtype=int)
 
             self._line_inject_maps.append((line, k_idx, m_idx, nc, is_multi, has_full))
             self._line_vk_bufs[line.name] = np.zeros(nc, dtype=np.float64)
@@ -2618,6 +3136,15 @@ class EMTPSolver:
             vs.name: idx for idx, vs in enumerate(self._vs_list)
         }
 
+        # ---- 源预采样 (可选优化) ----
+        if self.pre_sample_sources:
+            self._pre_sample_sources(n_steps)
+
+        # Lock the node indexer so no new external ids can sneak in during
+        # the main loop.  From here on all MNA dimensions use _compact_n.
+        self._indexer.freeze()
+        self._compact_n = self._indexer.n
+
         t_init_end = _t()
         self._timing['init'] = t_init_end - t_run_start
 
@@ -2625,27 +3152,36 @@ class EMTPSolver:
         for step_idx in range(n_steps):
             self.time = step_idx * self.dt
 
-            # 1. 开关状态
+            # 1. switch events
             t0 = _t()
-            self._update_switch_states()
+            if self._runtime.step_pre_solve(
+                self.time, self._devices, set(self._lpm_elements),
+            ):
+                self.mark_topology_changed("switch event")
             t1 = _t()
             self._timing['switch_update'] += t1 - t0
 
-            # 2. 核心求解
+            # 2. core solve
             V = self._solve_step()
             t2 = _t()
             self._timing['solve_step_total'] += t2 - t1
 
-            # 3. 支路量更新（写入预分配缓冲区）
-            self._update_branch_quantities(V, step_idx, n_steps)
+            # 3. branch V/I update (MUST precede probes)
+            self._runtime.step_post_solve_V_I(
+                V, self._devices, self._indexer,
+                step_idx, n_steps,
+                bool(getattr(self, 'record_branch_history', False)),
+                self._branch_v_bufs, self._branch_i_bufs,
+            )
             t3 = _t()
             self._timing['branch_update'] += t3 - t2
 
-            # 4. 轻量探针和数据记录。必须在历史源递推前完成，
-            # 否则 L/C/SERIES_RL 探针会读到下一步 Ihist。
+            # 4. probe / time / voltage recording (before history update
+            #    so that L/C/SRL probes see current-step Ihist)
             self._record_probes(step_idx, V)
             self._time_array_buf[step_idx] = self.time
-            self._voltage_buf[:, step_idx] = V
+            if self._voltage_buf is not None:
+                self._voltage_buf[:, step_idx] = V
 
             self._update_source_history()
 
@@ -2658,23 +3194,21 @@ class EMTPSolver:
             t_probe = _t()
             self._timing['probe_store'] += t_probe - t3
 
-            # 5. 传输线合并更新（state + history，ULMLine 单次 JIT）
+            # 5. transmission lines
             self._update_lines_combined(V)
             t4 = _t()
             self._timing['line_combined_update'] += t4 - t_probe
 
-            # 6. 支路历史源
-            self._update_history_sources()
-            t5 = _t()
-            self._timing['branch_history_update'] += t5 - t4
+            # 6. branch reactive history (after probes, after lines)
+            self._runtime.step_post_solve_history(self._devices)
 
-            # 7. 变压器历史源
+            # 7. transformer history
             self._update_transformer_history(V)
-            t6 = _t()
-            self._timing['transformer_history'] += t6 - t5
+            t5 = _t()
+            self._timing['transformer_history'] += t5 - t4
 
-            t7 = _t()
-            self._timing['data_store'] += t7 - t6
+            t6 = _t()
+            self._timing['data_store'] += t6 - t5
 
             self.step_count += 1
             self._stats['total_steps'] += 1
@@ -2688,10 +3222,13 @@ class EMTPSolver:
         actual_steps = n_steps
         self._actual_steps = actual_steps
         self.time_array = self._time_array_buf[:actual_steps]
-        self.voltage_results = {
-            i: self._voltage_buf[i - 1, :actual_steps]
-            for i in range(1, self.num_nodes + 1)
-        }
+        if self._voltage_buf is not None:
+            self.voltage_results = {
+                self._indexer.to_external(c): self._voltage_buf[c, :actual_steps]
+                for c in range(self._indexer.n)
+            }
+        else:
+            self.voltage_results = {}
         for name in self.voltage_sources:
             if name in self._vs_current_bufs:
                 self._vs_current_bufs[name] = self._vs_current_bufs[name][:actual_steps]
@@ -2712,11 +3249,11 @@ class EMTPSolver:
             logger.info("仿真完成,共 %d 步", self.step_count)
             self.print_solver_statistics()
 
+        self._results_valid = True
+
     def _reset_caches(self) -> None:
         """重置所有矩阵缓存。"""
-        self._G_dirty = True
-        self._cached_MNA = None
-        self._cached_splu = None
+        self._stamping.mark_dirty()
         self._active_mna_solver_name = _SPARSE_SOLVER_NAME
         self._vs_list = None
         self._vs_index_map = None
@@ -2749,6 +3286,7 @@ class EMTPSolver:
 
     def get_time(self, unit: str = 's') -> np.ndarray:
         """时间数组。unit ∈ {'s','ms','us','ns'}。"""
+        self._require_run_completed()
         t = np.asarray(self.time_array)
         return {'ms': t * 1e3, 'us': t * 1e6,
                 'ns': t * 1e9}.get(unit, t.copy())
@@ -2757,7 +3295,16 @@ class EMTPSolver:
         self, node: Union[str, int], unit: str = 'V',
     ) -> np.ndarray:
         """获取节点电压历史。支持字符串节点名或整数节点号。"""
-        node_id = self._resolve_node(node)
+        node_id = self._resolve_existing_node(node)
+        self._require_run_completed()
+        if not self.record_all_node_voltages:
+            raise RuntimeError(
+                "Full node voltage history was not recorded. Set "
+                "record_all_node_voltages=True before run(), or register a "
+                "voltage probe with add_voltage_probe() and use get_probe()."
+            )
+        if node_id == 0:
+            return np.zeros(self._actual_steps)
         if node_id not in self.voltage_results:
             label = self._node_label(node_id)
             raise ValueError(f"节点 {label} 不存在")
@@ -2767,6 +3314,7 @@ class EMTPSolver:
     def get_branch_current(self, name: str, unit: str = 'A') -> np.ndarray:
         if name not in self.branches:
             raise ValueError(f"支路 {name} 不存在")
+        self._require_run_completed()
         if hasattr(self, '_branch_i_bufs') and name in self._branch_i_bufs:
             actual = getattr(self, '_actual_steps', len(self._branch_i_bufs[name]))
             I = self._branch_i_bufs[name][:actual].copy()
@@ -2783,6 +3331,7 @@ class EMTPSolver:
     def get_branch_voltage(self, name: str, unit: str = 'V') -> np.ndarray:
         if name not in self.branches:
             raise ValueError(f"支路 {name} 不存在")
+        self._require_run_completed()
         if hasattr(self, '_branch_v_bufs') and name in self._branch_v_bufs:
             actual = getattr(self, '_actual_steps', len(self._branch_v_bufs[name]))
             V = self._branch_v_bufs[name][:actual].copy()
@@ -2798,6 +3347,7 @@ class EMTPSolver:
     def get_source_current(self, name: str) -> np.ndarray:
         if name not in self.current_sources:
             raise ValueError(f"电流源 {name} 不存在")
+        self._require_run_completed()
         data = np.array(self.current_sources[name].current_history)
         if data.size == 0:
             raise RuntimeError(
@@ -2812,6 +3362,7 @@ class EMTPSolver:
         """电压源电流历史(正方向:正端→外部电路→负端)。"""
         if name not in self.voltage_sources:
             raise ValueError(f"电压源 {name} 不存在")
+        self._require_run_completed()
         if hasattr(self, '_vs_current_bufs') and name in self._vs_current_bufs:
             I = self._vs_current_bufs[name].copy()
         else:
@@ -2827,6 +3378,7 @@ class EMTPSolver:
         """电压源激励电压历史。"""
         if name not in self.voltage_sources:
             raise ValueError(f"电压源 {name} 不存在")
+        self._require_run_completed()
         vs = self.voltage_sources[name]
         V = np.array([vs.voltage_at(t) for t in self.time_array])
         return {'kV': V / 1e3, 'mV': V * 1e3}.get(unit, V)
@@ -2841,6 +3393,7 @@ class EMTPSolver:
     ) -> np.ndarray:
         if name not in self.transmission_lines:
             raise ValueError(f"传输线 {name} 不存在")
+        self._require_run_completed()
         data = np.array(getattr(self.transmission_lines[name], attr))
         if data.size == 0:
             raise RuntimeError(

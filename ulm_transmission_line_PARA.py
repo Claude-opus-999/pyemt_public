@@ -502,8 +502,16 @@ def _print_matrix(matrix: np.ndarray, n: int, precision: int,
         print(f"{pad}[ " + " ".join(parts) + " ]")
 
 
-def create_test_fitulm_data(nf: int = 3, n_poles: int = 4) -> FitULMData:
-    """生成合成 FitULM 数据(用于单元测试或 JIT 预热)。"""
+def create_test_fitulm_data(
+    nf: int = 3,
+    n_poles: int = 4,
+    seed: Optional[int] = 1234,
+) -> FitULMData:
+    """生成合成 FitULM 数据(用于单元测试或 JIT 预热)。
+
+    seed 默认为固定值,保证回归测试可复现;传入 None 可恢复非确定性随机数据。
+    """
+    rng = np.random.default_rng(seed)
     nmod = nf
     yc_poles = np.array(
         [-1000 + 0j, -5000 + 2000j, -5000 - 2000j, -20000 + 0j][:n_poles]
@@ -511,13 +519,13 @@ def create_test_fitulm_data(nf: int = 3, n_poles: int = 4) -> FitULMData:
 
     yc_residues: List[np.ndarray] = []
     for _ in range(n_poles):
-        diag = np.random.uniform(0.001, 0.01, nf)
-        off_diag = np.random.uniform(0.0001, 0.001, (nf, nf))
+        diag = rng.uniform(0.001, 0.01, nf)
+        off_diag = rng.uniform(0.0001, 0.001, (nf, nf))
         matrix = off_diag + np.diag(diag)
         matrix = (matrix + matrix.T) / 2
         yc_residues.append(matrix.astype(complex))
 
-    yc_d = np.diag(np.random.uniform(0.003, 0.01, nf))
+    yc_d = np.diag(rng.uniform(0.003, 0.01, nf))
     yc_d = yc_d + yc_d.T - np.diag(np.diag(yc_d))
 
     time_delays = np.array([1e-5 * (i + 1) for i in range(nmod)])
@@ -536,8 +544,8 @@ def create_test_fitulm_data(nf: int = 3, n_poles: int = 4) -> FitULMData:
 
         residues: List[np.ndarray] = []
         for _ in range(n_h):
-            diag = np.random.uniform(0.3, 0.5, nf)
-            off_diag = np.random.uniform(0.01, 0.05, (nf, nf))
+            diag = rng.uniform(0.3, 0.5, nf)
+            off_diag = rng.uniform(0.01, 0.05, (nf, nf))
             residues.append((off_diag + np.diag(diag)).astype(complex))
         h_residues.append(residues)
 
