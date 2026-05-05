@@ -1,582 +1,825 @@
-# EMTP 电磁暂态求解器 — 架构文档
+# EMTP 电磁暂态求解器 — 架构文档 v3.0
 
 ## 1. 项目概述
 
 `emtp_v0.2` 是一个基于 Python 的电磁暂态（EMTP）仿真求解器，使用修正节点分析法（MNA）进行电路求解，集成了多相传输线、非线性元件、UMEC 变压器和绝缘子闪络模型。
 
+**仓库**: `github.com/Claude-opus-999/pyemt_public`
+**当前 commit**: `cf8b7dc` (159 tests, 0 failures)
+**Python**: 3.12+ | **依赖**: numpy, scipy
+
 ### 1.1 文件清单
 
-| 文件 | 大小 | 说明 |
-|---|---|---|
-| `emtp/solver.py` | ~3500 行 | **主求解器**（canonical 实现） |
-| `emtp_solver_v3.py` | ~144 行 | legacy compatibility shim |
-| `emtp/runtime/` | 包 | DynamicDeviceRuntime + ResolveManager |
-| `emtp/results/` | 包 | 结果 helper + ResultStore |
-| `emtp/devices/multiport.py` | ~100 行 | MultiPortDevice 协议 |
-| `emtp/lines/bergeron.py` | ~90 行 | BergeronLineDevice adapter |
-| `emtp/lines/ulm.py` | ~140 行 | ULMLineDevice adapter |
-| `emtp/transformers/umec.py` | ~110 行 | UMECTransformerDevice adapter |
-| `emtp_components_series_rl_only.py` | 4 KB / 129 行 | 基础数据结构（Branch, ElementType, CurrentSource） |
-| `transmission_line_emtp_v2.py` | 10 KB | Bergeron 传输线模型 |
-| `ulm_transmission_line_PARA.py` | 96 KB | ULM 通用线路模型（含并行 batch） |
-| `umec_transformer.py` | 22 KB | UMEC 多端口变压器模型 |
-| `nonlinear_models_pscad.py` | 28 KB | PSCAD 风格分段非线性（MOA 避雷器）、LPM 绝缘子闪络 |
-| `atp_lightning_current_generator_simplified.py` | 34 KB | ATP 兼容雷电电流源（Heidler/双指数） |
-| `emtp_plotting.py` | 4 KB | 辅助绘图 |
-| `tests/test_solver_regression.py` | 657 行 / 56 个测试 | 回归 + 单元测试 |
+| 文件 | 行数 | 说明 |
+|------|------|------|
+| `emtp/solver.py` | 3525 | **主求解器** — canonical EMTPSolver 实现 |
+| `emtp/circuit.py` | 73 | CircuitModel — 元件数据容器 |
+| `emtp/nodes.py` | — | NodeIndexer / NodeBook — 节点管理 |
+| `emtp/types.py` | 188 | Branch / CurrentSource / VoltageSource / RHSPlan 等数据类型 |
+| `emtp/stamping.py` | 157 | COOStamper / StampingEngine — MNA G 矩阵装配 |
+| `emtp/sparse_solver.py` | 84 | SparseLinearSolver — SuperLU 稀疏求解 |
+| `emtp/validation.py` | — | Circuit 校验 |
+| `emtp/results/__init__.py` | 87 | 结果 helper 函数（单位缩放、节点电压/支路电流读取） |
+| `emtp/results/store.py` | 168 | ResultStore — 预分配结果缓冲区管理 |
+| `emtp/runtime/__init__.py` | 172 | DynamicDeviceRuntime — 每步状态管理 |
+| `emtp/runtime/resolve.py` | 129 | ResolveManager + ResolveEvent — 重解循环 |
+| `emtp/runtime/stepper.py` | 41 | TimeStepper — 主循环 |
+| `emtp/assembly/__init__.py` | 5 | 装配模块 |
+| `emtp/assembly/mna.py` | 108 | MNAAssembler — 系统矩阵/RHS 装配 |
+| `emtp/devices/base.py` | 47 | Device Protocol — 二端元件抽象接口 |
+| `emtp/devices/multiport.py` | 83 | MultiPortDevice Protocol — 多端口元件抽象接口 |
+| `emtp/devices/resistor.py` | — | ResistorDevice |
+| `emtp/devices/inductor.py` | — | InductorDevice |
+| `emtp/devices/capacitor.py` | — | CapacitorDevice |
+| `emtp/devices/switch.py` | — | SwitchDevice |
+| `emtp/devices/series_rl.py` | — | SeriesRLDevice |
+| `emtp/devices/nonlinear.py` | — | NonlinearResistorDevice (MOA) |
+| `emtp/devices/lpm.py` | — | LPMFlashoverDevice (绝缘子闪络) |
+| `emtp/lines/bergeron.py` | 81 | BergeronLineDevice — Bergeron 线路 MultiPort adapter |
+| `emtp/lines/ulm.py` | 130 | ULMLineDevice — ULM 线路 MultiPort adapter |
+| `emtp/transformers/umec.py` | 113 | UMECTransformerDevice — UMEC 变压器 MultiPort adapter |
+
+**外部底层模型**（可选依赖）:
+
+| 文件 | 说明 |
+|------|------|
+| `transmission_line_emtp_v2.py` | Bergeron 传输线底层模型 |
+| `ulm_transmission_line_PARA.py` | ULM 频率相关线路模型（含并行 batch） |
+| `umec_transformer.py` | UMEC 多端口变压器模型 |
+| `nonlinear_models_pscad.py` | PSCAD 风格分段 MOA + LPM 绝缘子闪络 |
+| `atp_lightning_current_generator_simplified.py` | ATP 兼容雷电电流源 |
+
+**兼容入口**:
+
+| 文件 | 行数 | 说明 |
+|------|------|------|
+| `emtp_solver_v3.py` | 144 | Legacy compat shim — 转发到 `emtp.solver` |
 
 ---
 
 ## 2. 分层架构
 
-求解器采用 **四层引擎架构**，从底层数据结构到顶层门面逐步组合：
+求解器采用**五层架构**，从底层数据结构到顶层门面逐步组合：
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    EMTPSolver (门面层)                        │
-│  ~2900 行：add_* / validate / run / get_* / probes / print   │
-│                                                              │
-│  组合三个引擎 + 探针管理 + 校验 + 结果 API                      │
-└──────┬──────────────────┬──────────────────┬─────────────────┘
-       │                  │                  │
-       ▼                  ▼                  ▼
-┌──────────────┐  ┌───────────────┐  ┌──────────────────────┐
-│StampingEngine│  │SparseLinear   │  │DynamicDeviceRuntime  │
-│              │  │   Solver      │  │                      │
-│ G 矩阵装配    │  │               │  │ 每步状态管理           │
-│ RHS 缓冲复用  │  │ LU 分解缓存    │  │ · 开关定时事件        │
-│ COO 生命周期  │  │ 奇异正则化     │  │ · 支路 V/I 更新       │
-│              │  │               │  │ · 历史源递推           │
-└──────┬───────┘  └───────────────┘  │ · 非线性/LPM/UMEC     │
-       │                             │   收敛检测             │
-       │                             └──────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                    EMTPSolver (门面层)                             │
+│  add_* / validate / run / get_* / probes / print                 │
+│                                                                    │
+│  组合: CircuitModel + MNAAssembler + SparseLinearSolver           │
+│        + DynamicDeviceRuntime + ResolveManager + TimeStepper      │
+│        + ResultStore + Device/MultiPortDevice                     │
+└──────┬────────────┬────────────┬─────────────┬────────────────────┘
+       │            │            │             │
+       ▼            ▼            ▼             ▼
+┌───────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐
+│  Circuit  │ │  MNA     │ │  Sparse  │ │  TimeStepper │
+│  Model    │ │ Assembler│ │  Linear  │ │              │
+│           │ │          │ │  Solver  │ │  主循环      │
+│ 元件容器  │ │ G/RHS    │ │          │ │              │
+│ 节点管理  │ │ 装配     │ │ SuperLU  │ │  每步调度    │
+└───────────┘ └──────────┘ └──────────┘ └──────────────┘
+       │            │            │             │
+       └────────────┼────────────┼─────────────┘
+                    │            │
+                    ▼            ▼
+          ┌──────────────┐ ┌──────────────────┐
+          │  Device (7)  │ │ MultiPortDevice   │
+          │              │ │ (3 adapters)      │
+          │ R/L/C/SW/    │ │                  │
+          │ SRL/MOA/LPM  │ │ Bergeron/ULM/UMEC│
+          └──────────────┘ └──────────────────┘
+                    │            │
+                    ▼            ▼
+          ┌──────────────────────────────────┐
+          │    DynamicDeviceRuntime          │
+          │    + ResolveManager              │
+          │    + ResultStore                 │
+          └──────────────────────────────────┘
+```
+
+### 2.1 各层职责
+
+| 层 | 模块 | 职责 |
+|----|------|------|
+| **数据** | `types.py`, `nodes.py`, `circuit.py` | Branch / VoltageSource / NodeIndexer / CircuitModel |
+| **协议** | `devices/base.py`, `devices/multiport.py` | Device / MultiPortDevice 抽象接口 |
+| **实现** | `devices/`, `lines/`, `transformers/` | 7 个二端设备 + 3 个多端口 adapter |
+| **装配** | `stamping.py`, `assembly/mna.py`, `sparse_solver.py` | COO 累加 → CSC 矩阵 → SuperLU 求解 |
+| **运行时** | `runtime/`, `results/store.py` | 状态管理、重解循环、主循环、结果存储 |
+| **门面** | `solver.py` | EMTPSolver 统一 API |
+
+---
+
+## 3. MNA 修正节点分析
+
+### 3.1 数学原理
+
+EMTP 求解器使用**修正节点分析法**（Modified Nodal Analysis）构建电路方程。
+
+对于含 n 个节点和 m 个理想电压源的电路，构建 (n+m)×(n+m) 增广系统：
+
+```
+    ┌       ┐ ┌     ┐   ┌   ┐
+    │ G   B │ │  v  │   │ I │
+    │       │ │     │ = │   │
+    │ C   D │ │ i_s │   │ E │
+    └       ┘ └     ┘   └   ┘
+```
+
+- **G** (n×n): 节点导纳矩阵 — 所有二端元件和传输线的 Norton 等效电导
+- **B** (n×m): 电压源关联矩阵 — 每列包含 +1（正端）和 -1（负端）
+- **C** (m×n): = Bᵀ
+- **D** (m×m): 零矩阵
+- **v**: 节点电压向量（求解目标）
+- **i_s**: 电压源电流（求解副产物）
+- **I**: 独立电流源 + 历史源等效注入电流
+- **E**: 电压源设定值
+
+### 3.2 元件 Norton 等效
+
+每个动态元件使用**隐式梯形法**（trapezoidal integration）离散化为 Norton 等效电路：
+
+| 元件 | Geq | Ihist |
+|------|-----|-------|
+| 电阻 R | 1/R | 0 |
+| 电感 L | Δt/(2L) | -(i(t-Δt) + (Δt/(2L))·v(t-Δt)) |
+| 电容 C | 2C/Δt | i(t-Δt) + (2C/Δt)·v(t-Δt) |
+| 串联 RL | G_L/(1+R·G_L) | I_L_hist/(1+R·G_L) |
+| 开关 | 1/R_closed 或 1/R_open | 0 |
+| 传输线 | 1/Zc (两端) | I_hist_k, I_hist_m |
+| UMEC | G_tf (端口导纳矩阵) | I_hist_tf (端口历史电流) |
+
+### 3.3 稀疏求解
+
+矩阵以 `scipy.sparse.csc_matrix` 格式存储，使用 `scipy.sparse.linalg.splu`（SuperLU 后端）进行 LU 分解。矩阵仅在拓扑变化时重建，否则复用缓存的 LU 分解。
+
+---
+
+## 4. Device 协议体系
+
+求解器定义了两级元件协议：
+
+### 4.1 Device（二端元件）
+
+位于 `emtp/devices/base.py`，适用于所有传统二端支路元件：
+
+```python
+class Device(Protocol):
+    name: str                # 元件名
+    _branch: Branch          # 关联的 Branch 数据结构
+
+    def stamp_G(self, stamper, indexer):     # G 矩阵 stamp
+    def stamp_rhs(self, rhs, indexer, t):    # RHS 历史源注入
+    def update_branch_quantities(self, V, indexer):  # 求解后更新 V/I
+    def update_history(self, dt):            # 历史源递推
+    def reset_state(self):                   # 复位
+
+    @property
+    def is_dynamic(self) -> bool:            # 是否有动态状态
+    @property
+    def element_kind(self) -> str:           # 元件类型标签
+```
+
+**已有实现**（7 个）：
+
+| 类 | 文件 | 元件类型 |
+|----|------|---------|
+| `ResistorDevice` | `resistor.py` | 电阻 R |
+| `InductorDevice` | `inductor.py` | 电感 L（梯形离散） |
+| `CapacitorDevice` | `capacitor.py` | 电容 C（梯形离散） |
+| `SwitchDevice` | `switch.py` | 定时开关 |
+| `SeriesRLDevice` | `series_rl.py` | 串联 RL（无中间节点） |
+| `NonlinearResistorDevice` | `nonlinear.py` | 分段 MOA 避雷器 |
+| `LPMFlashoverDevice` | `lpm.py` | 先导发展法绝缘子闪络 |
+
+### 4.2 MultiPortDevice（多端口元件）
+
+位于 `emtp/devices/multiport.py`，适用于传输线和变压器等无法映射到单一 Branch 的复杂模型：
+
+```python
+class MultiPortDevice(Protocol):
+    name: str
+
+    @property
+    def ports(self) -> tuple[tuple[int, int], ...]:  # 端口列表
+    @property
+    def contributes_G(self) -> bool:                  # 是否贡献 G
+    @property
+    def is_dynamic(self) -> bool:                     # 是否有历史状态
+
+    def register_nodes(self, indexer):                # 注册节点
+    def stamp_G(self, stamper, indexer):              # G 矩阵 stamp
+    def stamp_rhs(self, rhs, indexer, t):             # RHS 注入
+    def update_after_solve(self, V, indexer, t):      # 求解后读取端口量
+    def update_history(self, V, indexer, dt):         # 历史源递推
+    def check_rebuild_required(self, V, indexer, t):  # 是否需要重建矩阵
+    def reset_state(self):                            # 复位
+```
+
+**已有 adapter**（3 个）：
+
+| 类 | 文件 | 底层模型 |
+|----|------|---------|
+| `BergeronLineDevice` | `lines/bergeron.py` | `transmission_line_emtp_v2.BergeronLine` |
+| `ULMLineDevice` | `lines/ulm.py` | `ulm_transmission_line_PARA.ULMLine` |
+| `UMECTransformerDevice` | `transformers/umec.py` | `umec_transformer.UMECTransformer` |
+
+**Protocol 与 adapter 的关系**：adapter 实现 Protocol 的全部方法，但内部仍然调用底层模型的现有逻辑。这种方式无需重写物理模型即可获得统一 dispatch 能力。
+
+**当前状态**：adapter 已验证协议正确性（Matrix/RHS stamping 与 legacy 路径等价），通过 `use_multiport_lines` / `use_multiport_transformers` feature flags 控制是否注册。默认关闭，待充分验证后切换。
+
+---
+
+## 5. 运行时系统
+
+### 5.1 DynamicDeviceRuntime — 每步状态管理
+
+`emtp/runtime/__init__.py:17`
+
+```python
+class DynamicDeviceRuntime:
+    def __init__(self, dt: float)
+
+    # 每步调用顺序:
+    def step_pre_solve(t, devices, lpm_names) -> bool           # 1. 定时开关
+    def step_post_solve_V_I(V, devices, indexer, ...)           # 3. 更新支路 V/I
+    def step_post_solve_history(devices)                        # 6. 历史源递推
+    def post_solve_resolve_check(V, t, lpm, transformers, ...)  # 重解检测
+```
+
+### 5.2 ResolveManager — 重解循环
+
+`emtp/runtime/resolve.py:48`
+
+```python
+class ResolveManager:
+    def __init__(self, max_iter: int = 5)
+
+    # 布尔接口（当前使用）
+    def solve_with_resolve(solve_fn, check_fn, stats, t) -> V
+
+    # 事件接口（新增，可替换布尔接口）
+    def solve_with_resolve_events(solve_fn, event_check_fn, stats, t) -> V
+
+    @property
+    def last_events -> list[ResolveEvent]
+```
+
+重解循环处理以下场景：
+
+```
+solve → check LPM flashover? → mark dirty → rebuild G → re-solve
+     → check UMEC saturation? → mark dirty → rebuild G → re-solve
+     → check MOA segment switch? → update Geq/Ihist → rebuild G → re-solve
+     → check MultiPortDevice.check_rebuild_required()
+     → converged → return V
+```
+
+### 5.3 ResolveEvent — 统一事件
+
+`emtp/runtime/resolve.py:18`
+
+```python
+@dataclass
+class ResolveEvent:
+    source: str                    # "LPM" | "MOA" | "UMEC" | "multiport"
+    device_name: str               # 触发事件的设备名
+    reason: str                    # "flashover" | "segment_switch" | "saturation"
+    requires_matrix_rebuild: bool  # 是否需要重建 G 矩阵
+    severity: str                  # "info" | "warning"
+```
+
+每次重解迭代中，所有触发源的事件被收集为 `list[ResolveEvent]`，统一记录和日志输出。
+
+### 5.4 TimeStepper — 主循环
+
+`emtp/runtime/stepper.py:14`
+
+```python
+class TimeStepper:
+    def run(self, solver, n_steps, timing) -> None:
+        for step_idx in range(n_steps):
+            solver._run_one_step(step_idx, n_steps, _t)
+        # Post-loop: export ULM batch state
+```
+
+`EMTPSolver.run()` 现为主循环委托 3 行：
+
+```python
+self._stepper.run(self, n_steps, self._timing)
+```
+
+### 5.5 每步执行顺序（关键！）
+
+```
+step_pre_solve(t)               ← 1. 定时开关事件
+    ↓
+_solve_step()                   ← 2. 求解 + 非线性/LPM/UMEC 重解
+    ↓
+step_post_solve_V_I(V)          ← 3. 支路电压/电流更新
+    ↓
+_record_probes(step_idx, V)     ← 4. 探针记录（在历史更新之前！）
+_time_array_buf[step_idx] = t
+_voltage_buf[:, step_idx] = V
+    ↓
+_update_lines_combined(V)       ← 5. 传输线状态更新
+    ↓
+step_post_solve_history()       ← 6. 支路历史源递推
+    ↓
+_update_transformer_history(V)  ← 7. 变压器历史源递推
+```
+
+探针必须在历史更新**之前**记录：这是因为探针需要看到当前步的 Ihist（梯形法的"当前"历史源），而非下一步的 Ihist。
+
+---
+
+## 6. 结果系统
+
+### 6.1 ResultStore — 预分配缓冲区
+
+`emtp/results/store.py:15`
+
+```python
+class ResultStore:
+    def __init__(self, n_nodes, n_steps, *,
+                 record_node_voltage, vs_names,
+                 record_branch_history, branch_names,
+                 voltage_probe_names, branch_current_probe_names)
+
+    # 缓冲区
+    time: np.ndarray                    # (n_steps,)
+    voltage: np.ndarray | None          # (n_nodes, n_steps)
+    vs_current: dict[str, np.ndarray]   # 电压源电流
+    branch_v / branch_i: dict           # 支路电压/电流
+    voltage_probe_data: np.ndarray      # 探针数据
+    branch_current_probe_data: np.ndarray
+
+    def record_step(step_idx, t, V, *, probe_values)  # 记录一步
+    def finalize(indexer)                              # 裁截 + 构建 voltage_results
+```
+
+### 6.2 接入策略：别名化
+
+`EMTPSolver._init_result_store()` 创建 `ResultStore` 后，将 solver 的旧 buffer 属性**别名化**为 `ResultStore` 的内部数组：
+
+```python
+self._time_array_buf = rs.time           # 别名
+self._voltage_buf = rs.voltage           # 别名
+self._vs_current_bufs = rs.vs_current    # 别名
+# ... 所有旧属性指向 ResultStore 内部缓冲区
+```
+
+**效果**：所有现有写入路径（`step_post_solve_V_I`、`_record_probes`、`run()` 循环体）无需修改，通过别名透明写入 `ResultStore`。
+
+### 6.3 结果查询 API
+
+所有 getter 委托到 `emtp/results/__init__.py` 中的独立函数：
+
+```python
+# 用户 API          → 委托到
+get_time(unit)       → emtp.results.scale_values
+get_node_voltage(n)  → emtp.results.node_voltage_from_solution
+get_branch_voltage(n)→ emtp.results.branch_voltage_from_solution
+get_branch_current(n)→ emtp.results.branch_current_from_solution
+get_voltage_probe(n) → emtp.results.scale_probe_values
+get_branch_current_probe(n) → emtp.results.scale_probe_values
+```
+
+---
+
+## 7. 电路校验
+
+`EMTPSolver.validate_circuit(strict=True)` 在 `run()` 开始时自动调用，检查：
+
+| 检查项 | 错误码 | 说明 |
+|--------|--------|------|
+| dt > 0, finish_time ≥ 0 | E001/E002 | 基本参数 |
+| 探针引用节点存在 | E003/E004 | 探针校验 |
+| 电路无节点 | E005 | 空电路 |
+| 电压源环路 | E006 | Union-Find 检测 |
+| 同一节点短路 | E007 | 拓扑 |
+| R/L/C/SW 参数为正 | E008-E011 | 参数校验 |
+| 电压源自环 | E012 | 拓扑 |
+| 浮空节点 | E013 | BFS 连通分量检测 |
+
+校验返回 `ValidationReport`，`strict=True` 时发现 error 直接抛 `RuntimeError`。
+
+---
+
+## 8. 元件添加 API
+
+### 8.1 基本无源元件
+
+```python
+solver = EMTPSolver(dt=1e-6, finish_time=100e-6)
+
+# 电阻
+solver.add_R("r1", node_from=1, node_to=0, R=10.0)
+solver.add_resistor("r1", 1, 0, R=10.0)   # alias
+
+# 电感（隐式梯形法离散，可选并联阻尼 Rp）
+solver.add_L("l1", 1, 2, L=1e-3, Rp=None)
+solver.add_inductor("l1", 1, 2, L=1e-3)
+
+# 电容
+solver.add_C("c1", 2, 0, C=1e-6, Rp=None)
+solver.add_capacitor("c1", 2, 0, C=1e-6)
+
+# 串联 RL（无中间节点，缩减矩阵维度）
+solver.add_series_RL("rl1", 1, 2, R=0.1, L=1e-3)
+
+# 开关
+solver.add_SW("sw1", 1, 2, t_close=10e-6, t_open=50e-6)
+solver.add_switch("sw1", 1, 2, t_close=10e-6)
+```
+
+### 8.2 电源
+
+```python
+# 独立电流源（支持函数、常数、LightningWaveform、ATP 雷电源）
+solver.add_IS("is1", 1, 0, lambda t: np.sin(2*np.pi*50*t))
+solver.add_current_source("is1", 1, 0, 5.0)   # 常数 5A
+
+# 理想电压源（MNA 增广方程）
+solver.add_VS("vs1", node_pos=1, node_neg=0, voltage_func=lambda t: 100.0)
+solver.add_voltage_source("vs1", 1, 0, 100.0)
+
+# ATP 雷电电流源
+solver.add_lightning_IS("lightning", 1, 0, model="heidlerf",
+                         peak=30e3, T1=1.2e-6, T2=50e-6)
+```
+
+### 8.3 传输线
+
+```python
+# Bergeron 无损传输线
+solver.add_bergeron_line("line1", node_k=1, node_m=3, Zc=300.0, tau=10e-6)
+
+# ULM 频率相关传输线
+solver.add_ulm_line("ulm1", nodes_k=1, nodes_m=3, fitulm_file="cable.fit", length=100.0)
+
+# 通用线路接口
+solver.add_line(line_interface_instance)
+```
+
+### 8.4 非线性元件
+
+```python
+# MOA 避雷器（从 V-I 数据文件）
+solver.add_MOA_from_file("moa1", 1, 0, file_path="moa.data",
+                          rated_voltage=100e3, voltage_is_pu=True)
+
+# LPM 绝缘子闪络
+solver.add_insulator_LPM("lpm1", 1, 2, gap_length=0.5,
+                          k=1e-6, E0=600.0, R_arc=1.0, R_open=1e9)
+```
+
+### 8.5 UMEC 变压器
+
+```python
+data = create_umec_transformer_3ph_bank(...)
+solver.add_UMEC_transformer("T1", data)
+```
+
+### 8.6 探针
+
+```python
+# 电压探针（可在 run 前随时添加）
+solver.add_voltage_probe("vp1", node_pos=2, node_neg=0)
+
+# 支路电流探针
+solver.add_branch_current_probe("ip1", branch_name="r1")
+```
+
+---
+
+## 9. 主循环详解
+
+```
+run()
+  │
+  ├─ validate_circuit()                    ← 拓扑 + 参数校验
+  ├─ reset_dynamic_state()                 ← 复位所有元件状态
+  ├─ _reset_caches()                       ← 清空 LU 缓存
+  │
+  ├─ _init_result_store(n_steps)           ← 创建 ResultStore + 别名化
+  │
+  ├─ [空电路快速路径]
+  │
+  ├─ compile_transmission_lines()          ← PSCAD 风格并行编译
+  ├─ _build_ulm_batch_runtime()            ← ULM batch 运行时
+  ├─ _indexer.freeze()                     ← 锁定节点映射
+  │
+  ├─ _stepper.run(self, n_steps, timing)   ← ★ TimeStepper 主循环
+  │     │
+  │     └─ for step_idx in range(n_steps):
+  │           ├─ solver._run_one_step(step_idx, n_steps, _t)
+  │           │     ├─ 1. step_pre_solve(t)          开关事件
+  │           │     ├─ 2. _solve_step()              solve + resolve
+  │           │     ├─ 3. step_post_solve_V_I(V)     支路 V/I 更新
+  │           │     ├─ 4. _record_probes()            探针记录
+  │           │     ├─ 5. _update_lines_combined(V)   传输线更新
+  │           │     ├─ 6. step_post_solve_history()   支路历史递推
+  │           │     └─ 7. _update_transformer_history 变压器历史递推
+  │           │
+  │     └─ export_model_state_to_lines()   ← ULM batch 状态导出
+  │
+  ├─ ResultStore.finalize(indexer)         ← 裁截 + voltage_results
+  ├─ 同步旧属性（向后兼容）
+  │
+  └─ print_timing_report()                 ← 计时统计
+```
+
+### 9.1 `_solve_step()` 内部
+
+```
+_solve_step()
+  │
+  └─ ResolveManager.solve_with_resolve(solve_fn, check_fn, ...)
        │
-       ▼
-┌────────────────────────────────────────┐
-│          7 个 Device 实现类              │
-│                                        │
-│  ResistorDevice    InductorDevice       │
-│  CapacitorDevice   SwitchDevice         │
-│  SeriesRLDevice    NonlinearResistorDevice │
-│  LPMFlashoverDevice                    │
-│                                        │
-│  每个类封装自身物理：                      │
-│  stamp_G / stamp_rhs /                  │
-│  update_branch_quantities /             │
-│  update_history / reset_state           │
-└────────────────┬───────────────────────┘
-                 │
-                 ▼
-        ┌────────────────┐
-        │  NodeIndexer    │
-        │                 │
-        │ ext ↔ compact   │
-        │ GND → -1        │
-        │ freeze()        │
-        └────────────────┘
+       └─ for resolve_round in range(MAX_SEG_ITER=5):
+             ├─ solve_fn()                ← _solve_segmented 或 _solve_linear
+             │     └─ _build_system_matrix() → _build_MNA_matrix + _build_MNA_rhs
+             │     └─ _solve_mna(MNA, rhs) → StampingEngine.solve → SuperLU
+             │
+             ├─ check_fn(V)               ← post_solve_resolve_check
+             │     ├─ LPM flashover?
+             │     ├─ UMEC saturation?
+             │     ├─ MOA segment change?
+             │     └─ MultiPortDevice.check_rebuild_required?
+             │
+             ├─ no change → return V
+             └─ changed  → mark_topology_changed → rebuild G → loop
 ```
-
----
-
-## 3. 第零层：基础数据结构
-
-### 3.1 NodeIndexer（L184-252）
-
-**职责**：将任意外部整数节点 ID 映射到紧凑的 [0, n) 索引区间。
-
-```python
-idx = NodeIndexer()
-idx.register(1)     # → 0
-idx.register(5)     # → 1
-idx.register(9999)  # → 2
-idx.n               # → 3 (矩阵维度，不是 9999)
-idx.freeze()        # 锁定，防止运行时新增节点
-```
-
-关键设计：
-- 外部节点 0（GND）始终映射到哨兵值 `COMPACT_GND = -1`
-- `register()` 幂等：重复注册同一节点不产生副作用
-- `freeze()` 后注册新节点抛出 `RuntimeError`
-- 在主循环前调用 `freeze()`，之后所有 MNA 维度使用 `idx.n`
-
-### 3.2 NodeBook（L254-377）
-
-字符串节点名 → 整数 ID 的自动分配器。支持 `reserve()` 手动绑定和 `alias()` 别名。
-
-### 3.3 VoltageSource（L387-408）
-
-理想电压源，带有 `node_pos`/`node_neg` 端点、`voltage_at(t)` 波形函数和 `current` 状态。
-
-### 3.4 ElementType / Branch / CurrentSource（emtp_components_series_rl_only.py）
-
-基础枚举和 dataclass：
-- `ElementType` 枚举：RESISTOR, INDUCTOR, CAPACITOR, SWITCH, SERIES_RL, NONLINEAR_RESISTOR, 等
-- `Branch`：二端支路 dataclass，含 `node_from/node_to`, `Geq/Ihist`（Norton 等效），`voltage/current` 状态
-- `CurrentSource`：独立电流源，含 `current_at(t)` 方法
-
----
-
-## 4. 第一层：设备抽象（Device Protocol）
-
-### 4.1 Device Protocol（L479-517）
-
-所有支路元件必须实现的接口：
-
-| 方法 | 职责 | 调用时机 |
-|---|---|---|
-| `stamp_G(stamper, indexer)` | 将 Norton 电导向 COO 累加器写入 | MNA 矩阵装配 |
-| `stamp_rhs(rhs, indexer, t)` | 将历史源电流写入 RHS 向量 | 每步 RHS 构建 |
-| `update_branch_quantities(V, indexer)` | 从 MNA 解向量 V 计算支路电压/电流 | 求解后、探针前 |
-| `update_history(dt)` | 递推历史源（梯形法则） | 探针后、每步末尾 |
-| `reset_state()` | 清除所有动态状态 | run() 开始前 |
-| `is_dynamic` (property) | 是否贡献历史项 | RHSPlan 编译 |
-| `element_kind` (property) | 元件类型标签 | 诊断/统计 |
-
-使用 `Protocol` + `@runtime_checkable` 而非 ABC，零运行时开销。
-
-### 4.2 COOStamper（L519-544）
-
-COO 三元组累加器，将稀疏矩阵装配与格式转换隔离：
-
-```python
-stamper = COOStamper(N)     # N = n_compact + m_vs
-stamper.add(row, col, val)  # 累加一个贡献
-A_csc = stamper.tocsc()     # 转为 CSC 供 SuperLU
-```
-
-### 4.3 七种 Device 实现
-
-| 类 | element_kind | is_dynamic | 物理特点 |
-|---|---|---|---|
-| `ResistorDevice` (L574) | `R` | False | 纯电阻：Geq = 1/R，无历史项 |
-| `InductorDevice` (L628) | `L` | True | 隐式梯形：Geq = Δt/(2L)，Ihistₖ₊₁ = Ihistₖ + 2·Geq·vₖ |
-| `CapacitorDevice` (L697) | `C` | True | 隐式梯形：Geq = 2C/Δt，Ihistₖ₊₁ = -Ihistₖ - 2·Geq·vₖ |
-| `SwitchDevice` (L766) | `SW` | False | 定时开关：G = 1/R_open 或 1/R_closed，含 `update_timed_state(t)` |
-| `SeriesRLDevice` (L862) | `SRL` | True | 串联 RL（无内部节点）：Geq = G_L/(1+R·G_L) |
-| `NonlinearResistorDevice` (L934) | `NR` | True | PSCAD 分段 MOA：Geq/Ihist 由 seg_helper 外部管理 |
-| `LPMFlashoverDevice` (L1006) | `LPM` | False | CIGRE 先导发展法闪络开关：状态由 LPM 模型驱动 |
-
-每个 Device 类在构造时创建对应的 `Branch` 对象（向后兼容旧 API），暴露 `_branch` 属性供 solver 访问。
-
----
-
-## 5. 第二层：引擎模块
-
-### 5.1 StampingEngine（L1083-1190）
-
-**职责**：MNA 稀疏矩阵装配 + RHS 构建 + 稀疏求解委托。
-
-#### G 矩阵装配（开放/闭合模式）
-
-```python
-eng = StampingEngine(indexer, allow_singular_regularization=True)
-
-# 开放 → solver 插入线/变压器贡献 → 闭合
-stamper = eng.begin_G(n_compact=3, n_vs=1)          # COOStamper(4)
-eng.stamp_devices_G(stamper, devices)                # 支路电导
-# [solver 在此插入 line.G_eq 和 transformer.G_tf 贡献]
-eng.stamp_vs_G(stamper, vs_list)                     # B/C 分块
-A_csc = eng.finish_G(stamper)                        # → CSC + 缓存 + bump matrix_id
-```
-
-#### 矩阵缓存
-
-| 属性 | 说明 |
-|---|---|
-| `G_dirty` | 拓扑变更时置 True，触发重装配 |
-| `cached_MNA` | 最近一次装配的 CSC 矩阵 |
-| `matrix_id` | 每次装配递增，供 `SparseLinearSolver` 做缓存键 |
-
-#### 稀疏求解
-
-```python
-V = eng.solve(MNA, rhs, vs_list)
-# → 内部委托 SparseLinearSolver.solve(A, b, matrix_id, n)
-# → V = x[:n]，VS 电流回写到 vs.current
-```
-
-#### mark_dirty
-
-`mark_dirty()` 清除 G 缓存和 LU 缓存；在 `finish_G()` 中自动清除 LU（因 matrix_id 变化）。
-
-### 5.2 SparseLinearSolver（L1192-1245）
-
-**职责**：纯线性代数层，独立于 MNA/Device 概念。
-
-```python
-solver = SparseLinearSolver(allow_singular_regularization=False)
-x = solver.solve(A, b, matrix_id=0, n_compact=3)
-# 首次调用：LU 分解 + 缓存
-# 同一 matrix_id：复用 LU 缓存，仅做回代
-# 不同 matrix_id：重分解
-solver.invalidate()  # 强制清除 LU 缓存
-```
-
-关键行为：
-- 矩阵奇异 + `allow_reg=False` → `RuntimeError`（含诊断信息）
-- 矩阵奇异 + `allow_reg=True` → 在节点电压块添加 `1e-12` 正则项后重试
-- LU 分解使用 `scipy.sparse.linalg.splu`（SuperLU 后端）
-
-### 5.3 DynamicDeviceRuntime（L1247-1396）
-
-**职责**：封装每时间步的状态管理操作。
-
-#### step_pre_solve(t, devices, lpm_names) → bool
-
-遍历 `SwitchDevice` 实例检查定时事件。跳过 LPM 控制的开关（LPM 由物理模型驱动，不由定时器驱动）。
-
-```python
-if self._runtime.step_pre_solve(t, devices, lpm_names):
-    self.mark_topology_changed("switch event")
-```
-
-#### step_post_solve_V_I(V, devices, indexer, step_idx, n_steps, ...)
-
-更新支路电压/电流。**必须在探针记录之前调用**，否则探针将读到错误的值。
-
-```python
-self._runtime.step_post_solve_V_I(V, devices, indexer, step_idx, n_steps, ...)
-# 此后立即记录探针
-self._record_probes(step_idx, V)
-```
-
-#### step_post_solve_history(devices)
-
-递推 L/C/SRL 历史源（梯形法则）。**必须在探针记录之后调用**，因为 `CapacitorDevice.update_history` 会翻转 `Ihist` 符号。
-
-#### post_solve_resolve_check(V, t, ...) → bool
-
-**统一的三合一收敛检测**，替代旧的三层嵌套（segmented → LPM → UMEC）：
-
-1. **LPM 闪络检测**：检查所有 LPM 绝缘子的先导长度是否超过间隙 → 闭合开关
-2. **UMEC 饱和检测**：检查变压器铁芯是否切换饱和段 → 更新电导矩阵
-3. **分段非线性检测**：检查 MOA 避雷器是否越过 v-i 分段点 → 更新 Geq/Ihist
-
-返回 `True` 表示电路拓扑或参数改变，需要重新求解。调用者将此放入统一循环：
-
-```python
-for resolve_round in range(MAX_ITER):
-    V = self._solve_segmented()  # 或 _solve_linear
-    if not self._runtime.post_solve_resolve_check(V, t, ...):
-        break  # 收敛
-else:
-    logger.warning("未收敛")
-```
-
----
-
-## 6. 第三层：EMTPSolver 门面
-
-### 6.1 构造与组合（L1399-1640）
-
-```python
-solver = EMTPSolver(dt=1e-6, finish_time=100e-6, verbose=True)
-```
-
-`__init__` 按顺序初始化：
-1. **参数存储**：`dt`, `finish_time`, `verbose`, `record_*` 开关
-2. **元件容器**：`branches`, `current_sources`, `voltage_sources`, `transmission_lines`, `transformers`, `lines`
-3. **节点管理**：`num_nodes`, `_node_set`, `_vs_node_set`
-4. **核心对象**：
-   - `self.nodes = NodeBook(start=1)` — 命名节点管理
-   - `self._indexer = NodeIndexer()` — compact 索引
-   - `self._runtime = DynamicDeviceRuntime(self.dt)` — 运行时
-   - `self._stamping = StampingEngine(self._indexer, ...)` — 矩阵装配 + 求解
-5. **探针**：`voltage_probes`, `branch_current_probes`
-6. **非线性/LPM/统计/计时/ULM batch**
-
-### 6.2 公共 API：添加元件
-
-| 方法 | 创建的 Device | 说明 |
-|---|---|---|
-| `add_R(name, nf, nt, R)` | `ResistorDevice` | 电阻 |
-| `add_L(name, nf, nt, L, Rp)` | `InductorDevice` | 电感（隐式梯形） |
-| `add_C(name, nf, nt, C, Rp)` | `CapacitorDevice` | 电容（隐式梯形） |
-| `add_SW(name, nf, nt, ...)` | `SwitchDevice` | 定时开关 |
-| `add_switch(...)` | → `add_SW` | 别名 |
-| `add_series_RL(name, nf, nt, R, L)` | `SeriesRLDevice` | 串联 RL |
-| `add_IS(name, nf, nt, func)` | `CurrentSource` | 独立电流源 |
-| `add_VS(name, nf, nt, func)` | `VoltageSource` | 理想电压源 |
-| `add_lightning_IS(...)` | `CurrentSource` + 雷电波形 | ATP 雷电源 |
-| `add_MOA_from_file(...)` | `NonlinearResistorDevice` | 分段 MOA |
-| `add_insulator_LPM(...)` | `LPMFlashoverDevice` | 绝缘子闪络 |
-| `add_bergeron_line(...)` | `TransmissionLineInterface` | Bergeron 传输线 |
-| `add_ulm_line(...)` | `ULMLine` | ULM 通用线路 |
-| `add_UMEC_transformer(...)` | `UMECTransformer` | UMEC 变压器 |
-
-每个 `add_*` 方法按统一模式操作：
-```python
-def add_R(self, name, node_from, node_to, R):
-    self._ensure_unique_device_name(name, "resistor")
-    node_from = self._resolve_node(node_from)
-    node_to = self._resolve_node(node_to)
-    dev = ResistorDevice(name, node_from, node_to, R)
-    self.branches[name] = dev._branch       # 向后兼容
-    self._update_node_count(node_from, node_to)  # 更新 NodeIndexer
-    self._devices.append(dev)               # 加入 Device 列表
-    self.mark_topology_changed(f"add resistor: {name}")
-```
-
-### 6.3 探针 API
-
-| 方法 | 说明 |
-|---|---|
-| `add_voltage_probe(name, node_pos, node_neg)` | 注册电压差探针 |
-| `add_branch_current_probe(name, branch_name)` | 注册支路电流探针 |
-| `get_probe(name, unit)` | 统一读取探针波形 |
-| `list_probes()` | 列出已注册探针 |
-
-### 6.4 结果 API
-
-| 方法 | 返回 | 说明 |
-|---|---|---|
-| `get_time(unit)` | `ndarray` | 时间序列 |
-| `get_node_voltage(node, unit)` | `ndarray` | 节点电压（支持 GND=0） |
-| `get_branch_current(name, unit)` | `ndarray` | 支路电流 |
-| `get_branch_voltage(name, unit)` | `ndarray` | 支路电压 |
-| `get_source_current(name)` | `ndarray` | 电流源输出 |
-| `get_vs_current(name, unit)` | `ndarray` | 电压源电流 |
-| `get_vs_voltage(name, unit)` | `ndarray` | 电压源电压 |
-| `get_solver_statistics()` | `dict` | 求解统计（G 重建次数、分段切换等） |
-| `get_timing_report()` | `dict` | 各阶段计时 |
-| `print_solver_statistics()` | — | 打印统计 |
-| `print_timing_report()` | — | 打印计时 |
-| `print_circuit_summary()` | — | 打印电路摘要 |
-
-### 6.5 主循环（run() 方法，L3943-4170）
-
-```python
-def run(self):
-    # 0. 校验 + 重置
-    report = self.validate_circuit()
-    self.reset_dynamic_state()
-    self._reset_caches()
-
-    # 1. 预分配输出数组（compact 维度）
-    n_steps = int(round(finish_time / dt)) + 1
-    self._voltage_buf = np.zeros((self._indexer.n, n_steps))
-
-    # 2. 预编译传输线注入映射 + ULM batch
-    self._build_ulm_batch_runtime()
-
-    # 3. 锁定节点索引
-    self._indexer.freeze()
-    self._compact_n = self._indexer.n
-
-    # 4. 时间步循环
-    for step_idx in range(n_steps):
-        t = step_idx * self.dt
-
-        # 4a. 开关定时事件
-        if self._runtime.step_pre_solve(t, self._devices, lpm_set):
-            self.mark_topology_changed()
-
-        # 4b. 统一求解 + 非线性/LPM/UMEC 收敛循环
-        V = self._solve_step()
-
-        # 4c. 支路 V/I 更新（必须在探针之前）
-        self._runtime.step_post_solve_V_I(V, ...)
-
-        # 4d. 探针 + 电压记录
-        self._record_probes(step_idx, V)
-
-        # 4e. 传输线更新
-        self._update_lines_combined(V)
-
-        # 4f. 支路历史源递推（必须在探针之后）
-        self._runtime.step_post_solve_history(self._devices)
-
-        # 4g. 变压器历史源递推
-        self._update_transformer_history(V)
-
-    # 5. 后处理：截断 + voltage_results 字典（外部 ID 键）
-    self.voltage_results = {
-        self._indexer.to_external(c): self._voltage_buf[c, :]
-        for c in range(self._indexer.n)
-    }
-```
-
-### 6.6 _solve_step 统一收敛循环（L3320-3360）
-
-```python
-def _solve_step(self):
-    for resolve_round in range(self._MAX_SEG_ITER):
-        V = self._solve_segmented()   # 含 nonlinear 内循环
-              # 或 self._solve_linear()  # 无非线性时
-
-        if not self._runtime.post_solve_resolve_check(
-            V, t, lpm_elements, ..., transformers, ..., seg_helper, ...
-        ):
-            break  # 三个触发器均未激活 → 收敛
-
-    return V
-```
-
-三段触发器统一处理：
-1. `_solve_segmented` 内循环处理 PSCAD 分段非线性
-2. `post_solve_resolve_check` 同时检查 LPM 闪络 + UMEC 饱和 + 分段边界
-
-### 6.7 校验（validate_circuit）
-
-`validate_circuit(strict=True)` 执行多层检查：
-1. **参数校验**：dt > 0, finish_time >= 0
-2. **探针校验**：引用的节点/支路是否存在
-3. **空电路**：无支路 + 无源 → 跳过 MNA
-4. **节点校验**：非地节点数 > 0
-5. **内存警告**：估计结果缓存大小
-6. **稀疏节点 ID 警告**：max(ext_id) > 10 × unique_nodes
-7. **支路校验**：R/L/C 正值、电压源自环、浮空电流源检测（并查集连通性）
-
-返回 `ValidationReport`，含 `errors()` / `warnings()` / `has_errors` / `has_warnings`。
-
----
-
-## 7. 数据流全景
-
-```
-用户 API 调用
-    │
-    ├─ add_R/L/C/SW/...  ──→ 创建 Device ──→ branches[name] = dev._branch
-    │                                       ──→ _devices.append(dev)
-    │                                       ──→ _indexer.register(node_id)
-    │
-    └─ run()
-         │
-         ├─ validate_circuit()    检查电路完整性
-         ├─ reset_dynamic_state()  for dev: dev.reset_state()
-         ├─ _indexer.freeze()     锁定节点映射
-         │
-         └─ 主循环 [step_idx]
-              │
-              ├─ step_pre_solve(t)          开关定时事件 → mark_dirty?
-              │
-              ├─ _solve_step()              ←── 收敛循环 ──┐
-              │   ├─ _build_MNA_matrix()      G 矩阵装配     │
-              │   │   ├─ begin_G              COOStamper     │
-              │   │   ├─ stamp_devices_G      dev→stamper   │
-              │   │   ├─ stamp_lines_G        line→stamper  │
-              │   │   ├─ stamp_xfmrs_G        xfmr→stamper  │
-              │   │   ├─ stamp_vs_G           vs→stamper    │
-              │   │   └─ finish_G             → CSC + 缓存   │
-              │   ├─ _build_MNA_rhs()          RHS 向量     │
-              │   ├─ _solve_mna(MNA, rhs)     SuperLU 求解  │
-              │   └─ post_solve_resolve_check │ LPM+UMEC+NL │
-              │                                └── 需要重解? ─┘
-              │
-              ├─ step_post_solve_V_I(V)      支路 V/I 更新
-              ├─ _record_probes(V)           探针记录
-              ├─ _update_lines_combined(V)   传输线状态更新
-              ├─ step_post_solve_history()   历史源递推 (L/C/SRL)
-              └─ _update_transformer_history(V)  变压器历史
-```
-
----
-
-## 8. 测试覆盖
-
-**文件**：`tests/test_solver_regression.py`（657 行，56 个测试用例）
-
-### 8.1 测试分类
-
-| 测试类 | 用例数 | 覆盖内容 |
-|---|---|---|
-| `SolverRegressionTests` | 40 | 完整 solver 回归：基本元件、开关、探针、预采样、RHSPlan、校验、记忆估算 |
-| `NodeIndexerTests` | 10 | compact 映射：注册、冻结、幂等、GND、KeyError、solver 集成 |
-| `SparseLinearSolverTests` | 6 | LU 缓存、奇异检测、正则化、invalidate |
-
-### 8.2 关键回归用例
-
-| 用例 | 验证内容 |
-|---|---|
-| `test_run_uses_integer_steps_and_includes_finish_time` | 步数计算 + 时间终点 |
-| `test_capacitor_probe_includes_parallel_damping_current` | 电容并联阻尼电流（关键：Ihist 时序） |
-| `test_run_resets_dynamic_state` | 重复 run() 一致性 |
-| `test_timed_switch_events_are_consumed_once` | 开关事件 + G_rebuilds 统计 |
-| `test_rhs_plan_matches_legacy_rhs` | RHSPlan 快路径与普通路径等价 |
-| `test_large_integer_node_warning` | 稀疏 ID 警告 |
-| `test_validate_circuit_strict_mode_raises_on_errors` | 严格校验 |
-
----
-
-## 9. 设计决策与约束
-
-### 9.1 Compact Node Index
-
-外部节点 ID（如 9999）不再直接作为 MNA 矩阵下标。`NodeIndexer` 将外部 ID 映射到 [0, n) 紧凑区间。对于雷电仿真场景（节点 ID 可能到 10000+ 但实际独立节点 ~50），矩阵维度从 ~10000×10000 降至 ~50×50。
-
-### 9.2 Device Protocol 替代 ElementType 分发
-
-旧代码在 6 个位置维护 `if et == ElementType.X` 分支。新架构中每个 Device 类封装自己的物理逻辑，消除所有分支点。
-
-### 9.3 探针记录时序（关键约束）
-
-每步操作顺序不能颠倒：
-```
-step_post_solve_V_I → _record_probes → step_post_solve_history
-```
-
-因为 `CapacitorDevice.update_history()` 翻转 Ihist 符号（`Ihist = -Ihist - 2Geq·v`），探针必须在翻转前读取当前步值。
-
-### 9.4 三合一收敛循环
-
-旧的三层嵌套（segmented 内循环 → LPM 触发 → UMEC 触发）统一为一个 `post_solve_resolve_check` 调用，在统一的外层循环中处理所有三种收敛触发器。
-
-### 9.5 传输线和变压器
-
-传输线和变压器目前通过 **MultiPortDevice adapter** 提供了统一协议接口（BergeronLineDevice / ULMLineDevice / UMECTransformerDevice），但在 `_build_MNA_matrix` 和主循环中仍保持独立的 stamping/更新路径。这些 adapter 已验证协议正确性，尚未接入 solver 统一 dispatch——后续 PR 将逐步完成切换。
-
-MultiPortDevice 协议定义了统一的：
-- `stamp_G` / `stamp_rhs` — MNA 装配
-- `update_after_solve` / `update_history` — 求解后更新
-- `check_rebuild_required` — 触发拓扑重建（UMEC 饱和）
-
-### 9.6 向后兼容
-
-- `self.branches[name]` 字典继续维护，每个 Device 通过 `_branch` 属性暴露 Branch 对象
-- `voltage_results` 字典键使用外部节点 ID（通过 `to_external()` 反查）
-- `self.num_nodes` 保留为外部 ID 上界（仅用于诊断和打印）
 
 ---
 
 ## 10. 依赖关系
 
 ```
-emtp/solver.py  (canonical EMTPSolver)
-  ├── emtp/nodes.py                         (NodeBook, NodeIndexer)
-  ├── emtp/types.py                         (Branch, VoltageSource, ...)
-  ├── emtp/stamping.py                      (COOStamper, StampingEngine)
-  ├── emtp/sparse_solver.py                 (SparseLinearSolver, SuperLU)
-  ├── emtp/runtime/__init__.py              (DynamicDeviceRuntime)
-  ├── emtp/runtime/resolve.py               (ResolveManager)
-  ├── emtp/devices/base.py                  (Device Protocol)
-  ├── emtp/devices/multiport.py             (MultiPortDevice Protocol)
-  ├── emtp/devices/{resistor,inductor,...}  (7 个 Device 实现)
-  ├── emtp/results/__init__.py              (结果 helper 函数)
-  ├── emtp/results/store.py                 (ResultStore)
-  ├── emtp/lines/bergeron.py                (BergeronLineDevice adapter)
-  ├── emtp/lines/ulm.py                     (ULMLineDevice adapter)
-  ├── emtp/transformers/umec.py             (UMECTransformerDevice adapter)
-  ├── numpy / scipy.sparse                  (数值计算)
-  ├── [可选] transmission_line_emtp_v2.py   (Bergeron 底层模型)
-  ├── [可选] ulm_transmission_line_PARA.py  (ULM 底层模型 + batch)
-  ├── [可选] umec_transformer.py            (UMEC 底层模型)
-  ├── [可选] nonlinear_models_pscad.py      (MOA + LPM)
-  └── [可选] atp_lightning_current_generator_simplified.py  (雷电源)
+emtp/solver.py  (canonical EMTPSolver, 3525 行)
+  ├── emtp/circuit.py                   CircuitModel 数据容器
+  ├── emtp/nodes.py                     NodeBook, NodeIndexer
+  ├── emtp/types.py                     Branch, VoltageSource, CurrentSource, RHSPlan, ...
+  ├── emtp/stamping.py                  COOStamper, StampingEngine
+  ├── emtp/sparse_solver.py             SparseLinearSolver (SuperLU)
+  ├── emtp/validation.py                电路校验
+  │
+  ├── emtp/runtime/__init__.py          DynamicDeviceRuntime
+  ├── emtp/runtime/resolve.py           ResolveManager, ResolveEvent
+  ├── emtp/runtime/stepper.py           TimeStepper
+  │
+  ├── emtp/results/__init__.py          结果 helper 函数 (scale_values, ...)
+  ├── emtp/results/store.py             ResultStore
+  │
+  ├── emtp/devices/base.py              Device Protocol
+  ├── emtp/devices/multiport.py         MultiPortDevice Protocol
+  ├── emtp/devices/{resistor,inductor,capacitor,switch,series_rl,nonlinear,lpm}.py
+  │
+  ├── emtp/lines/bergeron.py            BergeronLineDevice adapter
+  ├── emtp/lines/ulm.py                 ULMLineDevice adapter
+  ├── emtp/transformers/umec.py         UMECTransformerDevice adapter
+  │
+  ├── emtp/assembly/mna.py              MNAAssembler skeleton
+  │
+  ├── numpy                             (数值计算)
+  ├── scipy.sparse / scipy.sparse.linalg (CSC 稀疏矩阵 + SuperLU)
+  │
+  ├── [可选] transmission_line_emtp_v2.py              Bergeron 底层模型
+  ├── [可选] ulm_transmission_line_PARA.py             ULM 底层模型 + batch
+  ├── [可选] umec_transformer.py                       UMEC 底层模型
+  ├── [可选] nonlinear_models_pscad.py                 MOA + LPM
+  └── [可选] atp_lightning_current_generator_simplified.py  雷电源
 
 emtp_solver_v3.py  (144 行 legacy compat shim)
-  └── from emtp.solver import EMTPSolver   → 重导出到旧入口
+  └── from emtp.solver import EMTPSolver
+      └── 重导出所有 emtp.* 符号以便旧导入路径兼容
 ```
 
 ---
 
-## 11. 性能特征
+## 11. 导入约定
 
-| 优化点 | 实现方式 |
-|---|---|
-| MNA 矩阵缓存 | `StampingEngine` 按脏位复用 CSC 矩阵，仅在拓扑变化时重装配 |
-| LU 分解缓存 | `SparseLinearSolver` 按 `matrix_id` 复用分解结果 |
-| RHS 缓冲区 | `_rhs_buf` 每步 fill(0) 复用，避免 np.zeros 分配 |
-| RHSPlan 快路径 | 预编译平面索引数组，避免每步 Python 对象遍历 |
-| ULM batch | 多条 ULM 线路的 Numba 并行核（`ulm_transmission_line_PARA.py`） |
-| 预采样 | `pre_sample_sources=True` 时在仿真前预计算源波形数组 |
-| 电压/探针缓冲 | 预分配 `(compact_n, n_steps)` 矩阵，每步列写入 |
+### 11.1 推荐导入（新代码）
+
+```python
+from emtp import EMTPSolver
+from emtp.nodes import NodeBook, NodeIndexer
+from emtp.types import Branch, VoltageSource, ElementType
+from emtp.devices import Device, MultiPortDevice
+from emtp.lines import BergeronLineDevice, ULMLineDevice
+from emtp.transformers import UMECTransformerDevice
+```
+
+### 11.2 兼容导入（旧代码继续工作）
+
+```python
+from emtp_solver_v3 import EMTPSolver          # 返回同一个类
+from emtp_solver_v3 import NodeBook, NodeIndexer
+```
+
+### 11.3 Identity 保证
+
+```python
+from emtp import EMTPSolver as A
+from emtp.solver import EMTPSolver as B
+from emtp_solver_v3 import EMTPSolver as C
+assert A is B is C   # ← 永远为 True
+```
+
+### 11.4 包结构保证
+
+```python
+import emtp.runtime
+# emtp.runtime.__file__ → .../emtp/runtime/__init__.py  (package, not single file)
+
+import emtp.results
+# emtp.results.__file__ → .../emtp/results/__init__.py  (package, not single file)
+```
+
+`emtp/runtime.py` 和 `emtp/results.py` 作为单文件模块的旧形式**已永久移除**。
+
+---
+
+## 12. 配置选项
+
+```python
+solver = EMTPSolver(
+    # 时间参数
+    dt=1e-6,                      # 时间步长 (s)
+    finish_time=100e-6,           # 仿真结束时间 (s)
+
+    # 输出控制
+    verbose=True,                 # 打印计时和统计
+    record_all_node_voltages=True,# 记录全部节点电压（大型网络建议 False）
+    record_branch_history=False,  # 记录支路 V/I 历史
+    record_source_history=False,  # 记录电压源电流历史
+    record_line_history=False,    # 记录传输线端口历史
+
+    # 性能优化
+    pre_sample_sources=False,     # 预采样独立源（减少每步函数调用）
+    use_rhs_plan=False,           # 预编译 RHS 拓扑（极速路径）
+    line_compile_workers=None,    # 传输线并行编译线程数
+    compile_lines_on_add=False,   # 添加时立即编译线路
+
+    # ULM batch
+    ulm_batch_mode="auto",        # "auto" | "parallel" | "serial" | "off"
+    ulm_batch_parallel_threshold_factor=2,
+
+    # 稳定性
+    allow_singular_regularization=False,  # 奇异矩阵自动正则化
+    max_result_memory_mb=None,            # 结果内存上限告警
+
+    # Multiport dispatch (experimental)
+    use_multiport_lines=False,            # Bergeron/ULM 通过 MultiPortDevice
+    use_multiport_transformers=False,     # UMEC 通过 MultiPortDevice
+)
+```
+
+---
+
+## 13. 求解器统计信息
+
+`run()` 结束后可用：
+
+```python
+solver.print_timing_report()        # 计时分解（init/switch/solve/branch/line/...）
+solver.print_solver_statistics()    # G 重建次数、缓存命中率、重解次数
+
+solver._stats  # {
+#   'total_steps': 101,
+#   'segment_switches': 0,
+#   'segment_resolves': 0,
+#   'max_seg_iter': 0,
+#   'lpm_resolves': 0,
+#   'lpm_flashovers': 0,
+#   'lpm_extinctions': 0,
+#   'transformer_saturation_resolves': 0,
+#   'transformer_saturation_switches': 0,
+#   'G_rebuilds': 1,
+#   'G_cache_hits': 100,
+# }
+```
+
+---
+
+## 14. 测试
+
+### 14.1 测试矩阵（159 个）
+
+| 测试文件 | 数量 | 覆盖范围 |
+|----------|------|---------|
+| `test_solver_regression.py` | ~38 | API 回归：getter、probe、validate、pre_sample、rhs_plan |
+| `test_p5_basic_physics.py` | 4 | RC/RL/SRL 解析解验证 |
+| `test_trapezoidal_rlc.py` | 3 | 梯形法数值验证 |
+| `test_basic_mna.py` | 2 | MNA 基本求解 |
+| `test_switches.py` | 1 | 定时开关 |
+| `test_nodes.py` | 2 | NodeBook/NodeIndexer |
+| `test_moa_segments.py` | 1 | MOA 段切换 |
+| `test_lpm_flashover.py` | 2 | LPM 闪络 |
+| `test_p5_lpm_validation.py` | 4 | LPM 物理验证 |
+| `test_p5_moa_validation.py` | 4 | MOA 物理验证 |
+| `test_bergeron_line.py` | 2 | Bergeron 线路 smoke |
+| `test_p5_bergeron_reflection.py` | 3 | Bergeron 反射/开路/短路 |
+| `test_ulm_smoke.py` | 2 | ULM 线路 smoke |
+| `test_p5_ulm_validation.py` | 3 | ULM 物理验证 |
+| `test_umec_transformer.py` | 1 | UMEC Norton 等效 |
+| `test_p5_umec_validation.py` | 4 | UMEC 物理验证 |
+| `test_p5_tower_validation.py` | 3 | 杆塔（skip，缺数据） |
+| `test_multiport_contract.py` | 7 | MultiPortDevice 协议 |
+| `test_bergeron_adapter.py` | 12 | Bergeron adapter 等价性 |
+| `test_ulm_umec_adapters.py` | 12 | ULM/UMEC adapter smoke |
+| `test_multiport_registry.py` | 6 | MultiPort 注册表 skeleton |
+| `test_result_store.py` | 11 | ResultStore 独立测试 |
+| `test_import_canonical_paths.py` | 8 | import 路径规范 |
+| `test_circuit_model.py` | 5 | CircuitModel 容器 |
+| `test_mna_assembler.py` | 4 | MNAAssembler 装配 |
+
+### 14.2 运行测试
+
+```bash
+# 全部测试（排除缺外部依赖的 test_tower_case_p1.py）
+pytest tests/ -q --ignore=tests/test_tower_case_p1.py
+
+# 特定模块
+pytest tests/test_multiport_contract.py -v
+pytest tests/test_p5_basic_physics.py -v
+```
+
+---
+
+## 15. 架构迁移历程
+
+| 版本 | Commit | 关键变更 |
+|------|--------|---------|
+| v0.1 | `75f307e` | P3/P4/P5 模块化：Device 协议、emtp 包、物理验证 |
+| v0.2.0 | `d439b80` | Solver 迁移：emtp/solver.py canonical、去重、MultiPortDevice、ResolveManager、ResultStore（131 tests） |
+| v0.2.1 | `f42404b` | PR-10~17：ResultStore 接入、Multiport registry、Bergeron/ULM/UMEC adapter 注册、ResolveEvent、MNAAssembler（154 tests） |
+| v0.2.2 | `cf8b7dc` | PR-18~19：TimeStepper 主循环、CircuitModel 容器（159 tests） |
+
+### 15.1 从原型到可维护架构
+
+```
+原型阶段:
+  emtp_solver_v3.py (4580 行单体) + 散落外部模块 + 无统一接口
+
+第一阶段 (v0.2.0):
+  emtp/solver.py canonical + emtp_solver_v3.py shim
+  Device Protocol + 7 实现
+  MultiPortDevice Protocol + 3 adapter
+  DynamicDeviceRuntime 去重
+  ResolveManager / ResultStore
+
+第二阶段 (v0.2.1～v0.2.2):
+  ResultStore 真实接入 solver
+  MultiPortDevice 注册表 skeleton
+  Bergeron/ULM/UMEC adapter 验证等价性
+  ResolveEvent 事件体系
+  TimeStepper 主循环
+  CircuitModel 数据容器
+  MNAAssembler 骨架
+```
+
+### 15.2 下一步路线
+
+- [ ] MultiPortDevice 正式切换：`use_multiport_lines=True` 下删除旧 Bergeron/ULM/UMEC 特判路径
+- [ ] MNAAssembler 深度集成：接管 `_build_MNA_matrix` / `_build_MNA_rhs`
+- [ ] CircuitModel 深度集成：`add_*` 方法委托到 CircuitModel
+- [ ] 统一 ResolveEvent 替换布尔 check_fn
+- [ ] ULMBatchMultiPortDevice batch adapter
+
+---
+
+## 16. 快速开始
+
+```python
+from emtp import EMTPSolver
+
+# 1. 创建求解器
+solver = EMTPSolver(dt=1e-6, finish_time=100e-6)
+
+# 2. 搭建电路
+solver.add_VS("vs", 1, 0, lambda t: 100.0)       # 100V 电压源
+solver.add_R("r1", 1, 2, 10.0)                    # 10Ω 电阻
+solver.add_L("l1", 2, 0, 1e-3)                    # 1mH 电感
+
+# 3. 加探针
+solver.add_voltage_probe("v_l1", 2, 0)
+solver.add_branch_current_probe("i_r1", "r1")
+
+# 4. 运行
+solver.run()
+
+# 5. 读取结果
+t = solver.get_time("us")
+v_load = solver.get_voltage_probe("v_l1", "V")
+i_load = solver.get_branch_current_probe("i_r1", "A")
+
+print(f"V_load max: {v_load.max():.2f}V")
+print(f"I_load max: {i_load.max():.2f}A")
+
+# 6. 统计
+solver.print_timing_report()
+solver.print_solver_statistics()
+```
