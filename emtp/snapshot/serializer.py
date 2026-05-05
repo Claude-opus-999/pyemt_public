@@ -108,15 +108,31 @@ def _save_line_states(solver, path) -> None:
         with (path / "lines.json").open("w", encoding="utf-8") as f:
             json.dump(line_states, f, indent=2, ensure_ascii=False)
 
-    # snapshot support metadata
-    support_meta = {
-        "bergeron": "full",
-        "ulm": "unsupported",
-        "umec": "partial",
-        "lpm": "partial",
-    }
+    # snapshot support metadata — detect dynamically
+    support_meta = _detect_snapshot_support(solver)
     with (path / "snapshot_support.json").open("w", encoding="utf-8") as f:
         json.dump(support_meta, f, indent=2, ensure_ascii=False)
+
+
+def _detect_snapshot_support(solver) -> dict:
+    """Determine snapshot support level for each model category."""
+    support = {
+        "branch": "partial",
+        "lpm": "partial",
+        "umec": "partial",
+        "ulm": "unsupported",
+        "bergeron": "unsupported",
+    }
+
+    lines = getattr(solver, "transmission_lines", {})
+    if lines:
+        all_full = all(
+            hasattr(line, "get_state_dict") and hasattr(line, "set_state_dict")
+            for line in lines.values()
+        )
+        support["bergeron"] = "full" if all_full else "partial"
+
+    return support
 
 
 def _to_jsonable(value):

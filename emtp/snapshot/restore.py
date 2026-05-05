@@ -101,6 +101,20 @@ def load_snapshot_into_solver(solver, path, *, strict: bool = True) -> None:
     solver.time = meta.get("time", 0.0)
     solver.step_count = meta.get("step_index", 0)
 
+    # Mark lines as compiled so compile_transmission_lines (called by
+    # run_until) skips re-initialisation, preserving restored delay buffers.
+    solver._lines_compiled = True
+
+    # Ensure G_eq is set on restored Bergeron lines (normally done by
+    # initialize(), which we must skip to avoid buffer wipe).
+    for line in solver.transmission_lines.values():
+        if hasattr(line, "Zc") and getattr(line, "G_eq", 0.0) == 0.0:
+            line.G_eq = 1.0 / max(float(line.Zc), 1e-9)
+            if hasattr(line, "G_eq_k"):
+                line.G_eq_k = line.G_eq
+            if hasattr(line, "G_eq_m"):
+                line.G_eq_m = line.G_eq
+
     # Force MNA rebuild on next solve
     solver._reset_caches()
     solver.mark_topology_changed("snapshot restore")

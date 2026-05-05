@@ -99,6 +99,24 @@ class DelayBuffer:
         size = self.delay_steps + 2
         self.buffer = deque([initial_value] * size, maxlen=size)
 
+    def get_state_dict(self) -> dict:
+        return {
+            "delay_steps": int(self.delay_steps),
+            "fractional_delay": float(self.fractional_delay),
+            "buffer": [float(x) for x in list(self.buffer)],
+        }
+
+    def set_state_dict(self, state: dict) -> None:
+        expected_steps = int(state["delay_steps"])
+        if expected_steps != int(self.delay_steps):
+            raise ValueError(
+                f"DelayBuffer delay_steps mismatch: "
+                f"snapshot={expected_steps}, current={self.delay_steps}"
+            )
+        self.fractional_delay = float(state["fractional_delay"])
+        values = [float(x) for x in state["buffer"]]
+        self.buffer = deque(values, maxlen=self.buffer.maxlen)
+
     @classmethod
     def create_for_delay(cls, tau: float, dt: float) -> 'DelayBuffer':
         if dt <= 0:
@@ -115,6 +133,16 @@ class DelayBuffer:
         exact_steps = tau / dt
         delay_steps = int(exact_steps)
         return cls(delay_steps, exact_steps - delay_steps)
+
+
+def _ensure_delay_buffer(existing, state: dict) -> 'DelayBuffer':
+    """Return *existing* if not None, otherwise create a DelayBuffer from state."""
+    if existing is not None:
+        return existing
+    return DelayBuffer(
+        delay_steps=int(state["delay_steps"]),
+        fractional_delay=float(state["fractional_delay"]),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +286,54 @@ class BergeronLine(TransmissionLineInterface):
 
         if record_history:
             self.record_history()
+
+    def get_state_dict(self) -> dict:
+        """Return full dynamic state for snapshot save."""
+        return {
+            "name": self.name,
+            "I_hist_k": float(self.I_hist_k),
+            "I_hist_m": float(self.I_hist_m),
+            "V_k": float(getattr(self, "V_k", 0.0)),
+            "V_m": float(getattr(self, "V_m", 0.0)),
+            "I_k": float(getattr(self, "I_k", 0.0)),
+            "I_m": float(getattr(self, "I_m", 0.0)),
+            "buffer_k_to_m": (
+                self.buffer_k_to_m.get_state_dict()
+                if self.buffer_k_to_m is not None
+                else None
+            ),
+            "buffer_m_to_k": (
+                self.buffer_m_to_k.get_state_dict()
+                if self.buffer_m_to_k is not None
+                else None
+            ),
+        }
+
+    def set_state_dict(self, state: dict) -> None:
+        """Restore full dynamic state from a snapshot."""
+        self.I_hist_k = float(state.get("I_hist_k", self.I_hist_k))
+        self.I_hist_m = float(state.get("I_hist_m", self.I_hist_m))
+
+        if hasattr(self, "V_k"):
+            self.V_k = float(state.get("V_k", self.V_k))
+        if hasattr(self, "V_m"):
+            self.V_m = float(state.get("V_m", self.V_m))
+        if hasattr(self, "I_k"):
+            self.I_k = float(state.get("I_k", self.I_k))
+        if hasattr(self, "I_m"):
+            self.I_m = float(state.get("I_m", self.I_m))
+
+        if state.get("buffer_k_to_m") is not None:
+            self.buffer_k_to_m = _ensure_delay_buffer(
+                self.buffer_k_to_m, state["buffer_k_to_m"],
+            )
+            self.buffer_k_to_m.set_state_dict(state["buffer_k_to_m"])
+
+        if state.get("buffer_m_to_k") is not None:
+            self.buffer_m_to_k = _ensure_delay_buffer(
+                self.buffer_m_to_k, state["buffer_m_to_k"],
+            )
+            self.buffer_m_to_k.set_state_dict(state["buffer_m_to_k"])
 
     def get_info(self) -> Dict[str, Any]:
         return {

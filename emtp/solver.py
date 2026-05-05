@@ -3390,6 +3390,37 @@ class EMTPSolver:
                 vs.name: idx for idx, vs in enumerate(self._vs_list)
             }
 
+            # Ensure lines are compiled (needed for first run_until call
+            # and after load_snapshot).  Safe to call — it skips if already
+            # compiled unless force=True.
+            self.compile_transmission_lines(max_workers=self.line_compile_workers)
+            self._build_ulm_batch_runtime()
+
+            # Rebuild line inject maps (normally done in run() init)
+            self._line_inject_maps = []
+            self._line_vk_bufs = {}
+            self._line_vm_bufs = {}
+            for line in self.transmission_lines.values():
+                nk_list, nm_list = self._get_line_nodes(line)
+                nc = len(nk_list)
+                is_multi = self._is_multiphase_line(line)
+                has_full = hasattr(line, 'full_step')
+                k_idx = np.array(
+                    [self._indexer.to_compact(n) for n in nk_list], dtype=int,
+                )
+                m_idx = np.array(
+                    [self._indexer.to_compact(n) for n in nm_list], dtype=int,
+                )
+                self._line_inject_maps.append(
+                    (line, k_idx, m_idx, nc, is_multi, has_full),
+                )
+                self._line_vk_bufs[line.name] = np.zeros(nc, dtype=np.float64)
+                self._line_vm_bufs[line.name] = np.zeros(nc, dtype=np.float64)
+
+            # Sync _line_inject_maps_nonbatch so the non-batch path in
+            # _update_lines_combined picks up all lines (Bergeron, etc.).
+            self._line_inject_maps_nonbatch = list(self._line_inject_maps)
+
             if not self._is_empty_circuit():
                 self._indexer.freeze()
                 self._compact_n = self._indexer.n

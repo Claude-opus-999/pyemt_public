@@ -166,6 +166,8 @@ class ResultDatabase:
         self, run_id: str, signals: List[Dict[str, Any]],
     ) -> None:
         for sig in signals:
+            min_value = sig.get("min_value", sig.get("min"))
+            max_value = sig.get("max_value", sig.get("max"))
             self.conn.execute(
                 """INSERT OR REPLACE INTO waveform_signals
                    (run_id, name, kind, unit, length, min_value, max_value, peak_abs)
@@ -176,8 +178,8 @@ class ResultDatabase:
                     sig.get("kind"),
                     sig.get("unit"),
                     sig.get("length"),
-                    sig.get("min_value"),
-                    sig.get("max_value"),
+                    min_value,
+                    max_value,
                     sig.get("peak_abs"),
                 ),
             )

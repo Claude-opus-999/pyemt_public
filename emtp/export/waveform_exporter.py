@@ -101,22 +101,45 @@ def read_waveform_chunk(
 ) -> dict:
     """Read a chunk of a waveform signal from an NPZ result directory.
 
-    Returns ``{"signal", "start", "count", "time", "values"}``.
+    Slices along the last axis (time) for both 1-D and 2-D arrays.
+    Returns ``{"signal", "start", "count", "time", "values", "shape"}``.
     """
+    if start < 0:
+        raise ValueError("start must be >= 0")
+    if count <= 0:
+        raise ValueError("count must be > 0")
+
     result_dir = Path(result_dir)
     npz_path = result_dir / "waveforms.npz"
 
     with np.load(npz_path) as data:
-        time_full = data.get("time_s", np.array([]))
-        values_full = data.get(signal, np.array([]))
+        if "time_s" not in data:
+            raise KeyError("waveforms.npz does not contain 'time_s'")
+        if signal not in data:
+            raise KeyError(f"Signal {signal!r} not found in waveforms.npz")
 
-    end = min(start + count, len(values_full))
+        time_full = data["time_s"]
+        values_full = data[signal]
+
+        end = min(start + count, time_full.shape[0])
+        time = time_full[start:end]
+
+        if values_full.ndim == 1:
+            values = values_full[start:end]
+        elif values_full.ndim == 2:
+            values = values_full[..., start:end]
+        else:
+            raise ValueError(
+                f"Signal {signal!r} has unsupported ndim={values_full.ndim}"
+            )
+
     return {
         "signal": signal,
         "start": start,
-        "count": end - start,
-        "time": time_full[start:end].tolist(),
-        "values": values_full[start:end].tolist(),
+        "count": int(time.shape[-1]),
+        "time": time.tolist(),
+        "values": values.tolist(),
+        "shape": list(values.shape),
     }
 
 
