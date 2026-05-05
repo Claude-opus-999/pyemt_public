@@ -82,20 +82,51 @@ def save_snapshot(
 
 
 def _save_line_states(solver, path) -> None:
-    """Save per-line dynamic state (history currents)."""
+    """Save per-line dynamic state.
+
+    Lines with a ``get_state_dict`` method (e.g. BergeronLine) export
+    full dynamic state including delay buffers.  Other lines fall back
+    to saving I_hist only, with ``snapshot_support: partial``.
+    """
     line_states = {}
+    support_info: dict = {}
+
     for name, line in solver.transmission_lines.items():
-        state = {}
-        if hasattr(line, "I_hist_k"):
-            state["I_hist_k"] = float(line.I_hist_k) if np.ndim(line.I_hist_k) == 0 else line.I_hist_k.tolist()
-        if hasattr(line, "I_hist_m"):
-            state["I_hist_m"] = float(line.I_hist_m) if np.ndim(line.I_hist_m) == 0 else line.I_hist_m.tolist()
-        if state:
+        if hasattr(line, "get_state_dict"):
+            line_states[name] = line.get_state_dict()
+            support_info[name] = "full"
+        else:
+            state: dict = {"snapshot_support": "partial"}
+            if hasattr(line, "I_hist_k"):
+                state["I_hist_k"] = _to_jsonable(line.I_hist_k)
+            if hasattr(line, "I_hist_m"):
+                state["I_hist_m"] = _to_jsonable(line.I_hist_m)
             line_states[name] = state
+            support_info[name] = "partial"
 
     if line_states:
         with (path / "lines.json").open("w", encoding="utf-8") as f:
             json.dump(line_states, f, indent=2, ensure_ascii=False)
+
+    # snapshot support metadata
+    support_meta = {
+        "bergeron": "full",
+        "ulm": "unsupported",
+        "umec": "partial",
+        "lpm": "partial",
+    }
+    with (path / "snapshot_support.json").open("w", encoding="utf-8") as f:
+        json.dump(support_meta, f, indent=2, ensure_ascii=False)
+
+
+def _to_jsonable(value):
+    """Convert a numeric or array value to a JSON-serializable form."""
+    if isinstance(value, (int, float)):
+        return value
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        return float(arr)
+    return arr.tolist()
 
 
 def _save_lpm_states(solver, path) -> None:

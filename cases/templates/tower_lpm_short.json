@@ -1,0 +1,131 @@
+{
+  "schema_version": "0.1.0",
+  "case_name": "tower_lpm_short",
+  "description": "Short tower lightning transient with LPM insulators — demo / smoke test",
+  "simulation": {
+    "dt": 1e-9,
+    "finish_time": 1.5e-6,
+    "verbose": false,
+    "record_all_node_voltages": false,
+    "record_line_history": true,
+    "record_branch_history": true,
+    "record_source_history": true,
+    "pre_sample_sources": true,
+    "use_rhs_plan": true,
+    "output_stride": 5
+  },
+  "elements": [
+    {
+      "kind": "bergeron_line",
+      "name": "ZA10",
+      "node_k": 1,
+      "node_m": 2,
+      "Zc": 270.6,
+      "tau_per_m": 3.33333e-9,
+      "length_m": 12.3
+    },
+    {
+      "kind": "bergeron_line",
+      "name": "ZB10",
+      "node_k": 2,
+      "node_m": 3,
+      "Zc": 270.6,
+      "tau_per_m": 3.33333e-9,
+      "length_m": 10.3
+    },
+    {
+      "kind": "bergeron_line",
+      "name": "ZT11",
+      "node_k": 2,
+      "node_m": 4,
+      "Zc": 124.9,
+      "tau_per_m": 3.33333e-9,
+      "length_m": 8.0
+    },
+    {
+      "kind": "bergeron_line",
+      "name": "ZL11",
+      "node_k": 2,
+      "node_m": 4,
+      "Zc": 1124.0,
+      "tau_per_m": 3.33333e-9,
+      "length_m": 12.0
+    },
+    {
+      "kind": "resistor",
+      "name": "R_sI1",
+      "node_from": 1,
+      "node_to": 0,
+      "R": 270.6
+    },
+    {
+      "kind": "resistor",
+      "name": "R_sI2",
+      "node_from": 3,
+      "node_to": 0,
+      "R": 270.6
+    },
+    {
+      "kind": "resistor",
+      "name": "R_tower_arm",
+      "node_from": 4,
+      "node_to": 5,
+      "R": 0.01
+    },
+    {
+      "kind": "resistor",
+      "name": "R_tower_gnd",
+      "node_from": 8,
+      "node_to": 0,
+      "R": 20.0
+    },
+    {
+      "kind": "lpm_insulator",
+      "name": "Vbrk11",
+      "node_from": 5,
+      "node_to": 8,
+      "gap_length": 1.0,
+      "E0": 670.0,
+      "k": 1e-6,
+      "R_arc": 0.5,
+      "R_open": 1e9
+    }
+  ],
+  "sources": [
+    {
+      "kind": "standard_double_exponential_current",
+      "name": "I1S1",
+      "node_from": 0,
+      "node_to": 1,
+      "waveform_type": "2/20",
+      "peak": 100000.0,
+      "Tstart": 1e-6,
+      "PERC": 30
+    }
+  ],
+  "probes": [
+    {
+      "kind": "voltage",
+      "name": "V_top",
+      "node_pos": 2,
+      "node_neg": 0
+    },
+    {
+      "kind": "voltage",
+      "name": "V_mid",
+      "node_pos": 4,
+      "node_neg": 0
+    },
+    {
+      "kind": "branch_current",
+      "name": "I_gnd",
+      "branch": "R_tower_gnd"
+    }
+  ],
+  "outputs": {
+    "save_waveforms": true,
+    "save_metrics": true,
+    "save_plots": false,
+    "preferred_time_unit": "us"
+  }
+}

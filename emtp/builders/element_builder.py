@@ -58,12 +58,13 @@ def add_element_to_solver(solver, element: dict) -> None:
         return
 
     if kind == "bergeron_line":
+        tau = _resolve_bergeron_tau(element)
         solver.add_bergeron_line(
             element["name"],
             element["node_k"],
             element["node_m"],
             Zc=element["Zc"],
-            tau=element["tau"],
+            tau=tau,
         )
         return
 
@@ -90,7 +91,33 @@ def add_element_to_solver(solver, element: dict) -> None:
     raise ValueError(f"Unsupported element kind: {kind!r}")
 
 
+def _resolve_bergeron_tau(element: dict) -> float:
+    """Return propagation delay from either ``tau`` or ``tau_per_m * length_m``."""
+    if "tau" in element:
+        return float(element["tau"])
+    if "tau_per_m" in element and "length_m" in element:
+        return float(element["tau_per_m"]) * float(element["length_m"])
+    raise ValueError(
+        f"bergeron_line {element.get('name')!r} must provide either "
+        "'tau' or both 'tau_per_m' and 'length_m'"
+    )
+
+
 def _build_umec_data(element: dict):
-    """Minimal UMEC data builder — extended later with full config support."""
+    """UMEC transformer data builder."""
     from umec_transformer import UMECTransformerData
-    return UMECTransformerData(**element.get("data", {}))
+    from umec_transformer import create_umec_transformer_3ph_bank
+
+    if "data" in element:
+        return UMECTransformerData(**element["data"])
+
+    if "factory" in element:
+        factory = element["factory"]
+        if factory.get("kind") == "3ph_bank":
+            params = {k: v for k, v in factory.items() if k != "kind"}
+            return create_umec_transformer_3ph_bank(**params)
+
+    raise ValueError(
+        f"umec_transformer {element.get('name')!r} requires either "
+        "'data' or 'factory'"
+    )

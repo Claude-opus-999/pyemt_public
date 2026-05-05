@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .hashing import compute_topology_hash
+
 
 def load_snapshot_into_solver(solver, path, *, strict: bool = True) -> None:
     """Restore dynamic state from *path* into an already-configured *solver*.
@@ -20,17 +22,15 @@ def load_snapshot_into_solver(solver, path, *, strict: bool = True) -> None:
     path:
         Snapshot directory (contains metadata.json, branches.json, ...).
     strict:
-        If ``True``, raise when a snapshot entry references an unknown
-        branch/line/transformer.
+        If ``True``, validate dt, topology_hash, and raise on
+        unsupported snapshot support levels.
     """
     path = Path(path)
 
-    # -- metadata -----------------------------------------------------------
     meta = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
 
     if strict:
-        if abs(meta.get("dt", 0) - solver.dt) > 1e-30:
-            raise ValueError("Snapshot dt does not match solver dt")
+        _check_snapshot_metadata(solver, meta)
 
     # -- branches -----------------------------------------------------------
     if (path / "branches.json").exists():
@@ -63,11 +63,21 @@ def load_snapshot_into_solver(solver, path, *, strict: bool = True) -> None:
                 if strict:
                     raise ValueError(f"Snapshot line {name!r} not found in solver")
                 continue
+
             line = solver.transmission_lines[name]
-            if "I_hist_k" in state and hasattr(line, "I_hist_k"):
-                line.I_hist_k = state["I_hist_k"]
-            if "I_hist_m" in state and hasattr(line, "I_hist_m"):
-                line.I_hist_m = state["I_hist_m"]
+
+            if hasattr(line, "set_state_dict"):
+                line.set_state_dict(state)
+            else:
+                if strict and state.get("snapshot_support") == "partial":
+                    raise ValueError(
+                        f"Line {name!r} only has partial snapshot support. "
+                        "Re-run with strict=False to load partial state."
+                    )
+                if "I_hist_k" in state and hasattr(line, "I_hist_k"):
+                    line.I_hist_k = state["I_hist_k"]
+                if "I_hist_m" in state and hasattr(line, "I_hist_m"):
+                    line.I_hist_m = state["I_hist_m"]
 
     # -- LPM states ---------------------------------------------------------
     if (path / "lpm.json").exists():
@@ -94,3 +104,22 @@ def load_snapshot_into_solver(solver, path, *, strict: bool = True) -> None:
     # Force MNA rebuild on next solve
     solver._reset_caches()
     solver.mark_topology_changed("snapshot restore")
+
+
+def _check_snapshot_metadata(solver, meta: dict) -> None:
+    """Validate snapshot dt and topology_hash against current solver state."""
+    snap_dt = meta.get("dt")
+    if snap_dt is not None and abs(snap_dt - solver.dt) > 1e-30:
+        raise ValueError(
+            f"Snapshot dt ({snap_dt}) does not match solver dt ({solver.dt})"
+        )
+
+    expected_hash = meta.get("topology_hash")
+    if expected_hash:
+        actual_hash = compute_topology_hash(solver)
+        if actual_hash != expected_hash:
+            raise ValueError(
+                "Snapshot topology_hash does not match current solver topology. "
+                f"Expected: {expected_hash[:16]}..., "
+                f"Actual:   {actual_hash[:16]}..."
+            )
