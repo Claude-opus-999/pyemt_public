@@ -153,6 +153,7 @@ from emtp.lines.ulm import ULMLineDevice
 from emtp.lines.fitulm_resolver import FitULMSpec, FitULMResolver
 from emtp.transformers.umec import UMECTransformerDevice
 from emtp.registry import SimulationRegistry, ElementRecord, SourceRecord, MultiPortRecord
+from emtp.probes import ProbeManager
 from emtp.results import (                                # noqa: E402
     scale_probe_values,
     scale_values,
@@ -352,6 +353,9 @@ class EMTPSolver:
             node_book=self.nodes,
             node_indexer=self._indexer,
         )
+
+        # ---- 探针管理 (PR3) ----
+        self.probe_manager = ProbeManager()
 
         # ---- 轻量探针记录 ----
         # 只记录用户指定的节点/支路波形，避免开启全量 history。
@@ -583,7 +587,10 @@ class EMTPSolver:
             "node_neg": int(node_neg_id),
         }
         self._invalidate_results()
-        # Registry: probes are lightweight metadata, no topology impact
+        self.probe_manager.add_voltage_probe(
+            name=str(name), node_pos=int(node_pos_id),
+            node_neg=int(node_neg_id),
+        )
 
     def add_branch_current_probe(self, name: str, branch_name: str) -> None:
         """注册普通支路电流探针。"""
@@ -592,7 +599,9 @@ class EMTPSolver:
             "branch_name": str(branch_name),
         }
         self._invalidate_results()
-        # Registry: probes are lightweight metadata, no topology impact
+        self.probe_manager.add_branch_current_probe(
+            name=str(name), branch_name=str(branch_name),
+        )
 
     def _init_probe_storage(self, n_steps: int) -> None:
         """仿真开始前预分配探针结果数组。"""
