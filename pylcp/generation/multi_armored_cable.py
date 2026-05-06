@@ -69,16 +69,10 @@ def compute_multi_armored_cable_zy(
     """
     from LCP import cable_model
 
+    from ._soil import resolve_soil_params
+
     cables = geometry_config if isinstance(geometry_config, list) else [geometry_config]
-
-    rho = getattr(soil_config, "resistivity", 100.0) if soil_config else 100.0
-    mu_r_soil = getattr(soil_config, "permeability", 1.0) if soil_config else 1.0
-    eps_r = getattr(soil_config, "permittivity", 10.0) if soil_config else 10.0
-
-    omega = 2.0 * np.pi * freq
-    mu_0 = 4.0 * np.pi * 1e-7
-    sigma = 1.0 / rho
-    gamma_soil = np.sqrt(1j * omega * mu_0 * mu_r_soil * sigma - omega**2 * mu_0 * mu_r_soil * eps_r * 8.854e-12)
+    rho, mu_r_soil, eps_r, gamma_soil = resolve_soil_params(freq, soil_config)
 
     Z_matrix = cable_model.compute_multi_cable_impedance(freq, cables, gamma_soil)
     Y_matrix = _compute_multi_armored_admittance(freq, cables, cable_model)

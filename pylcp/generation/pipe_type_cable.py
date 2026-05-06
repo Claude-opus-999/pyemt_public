@@ -10,6 +10,20 @@ from typing import Any, Optional, Tuple
 import numpy as np
 
 
+def _safe_invert(M: np.ndarray, threshold: float = 1e12) -> np.ndarray:
+    """Invert a matrix, falling back to pseudo-inverse when ill-conditioned.
+
+    Uses try/except on LinAlgError instead of pre-computing the condition
+    number, avoiding a redundant SVD in the common well-conditioned case.
+    """
+    try:
+        return np.linalg.inv(M)
+    except np.linalg.LinAlgError:
+        if np.linalg.cond(M) < threshold:
+            raise
+        return np.linalg.pinv(M)
+
+
 def _potential_to_admittance(
     freq: np.ndarray,
     P_matrix: np.ndarray,
@@ -32,8 +46,7 @@ def _potential_to_admittance(
                 f"P_matrix 2D shape mismatch: expected "
                 f"{(n_conductors, n_conductors)}, got {P.shape}"
             )
-        cond = np.linalg.cond(P)
-        P_inv = np.linalg.pinv(P) if cond >= 1e12 else np.linalg.inv(P)
+        P_inv = _safe_invert(P)
         for k, w in enumerate(omega):
             Y[k] = 1j * w * P_inv
         return Y
@@ -45,10 +58,7 @@ def _potential_to_admittance(
                 f"{(K, n_conductors, n_conductors)}, got {P.shape}"
             )
         for k, w in enumerate(omega):
-            Pk = P[k]
-            cond = np.linalg.cond(Pk)
-            Pk_inv = np.linalg.pinv(Pk) if cond >= 1e12 else np.linalg.inv(Pk)
-            Y[k] = 1j * w * Pk_inv
+            Y[k] = 1j * w * _safe_invert(P[k])
         return Y
 
     raise ValueError(
@@ -84,16 +94,10 @@ def compute_pipe_type_cable_zy(
         compute_pipe_type_cable_potential as _compute_P,
     )
 
+    from ._soil import resolve_soil_params
+
     cable = geometry_config
-
-    rho = getattr(soil_config, "resistivity", 100.0) if soil_config else 100.0
-    mu_r_soil = getattr(soil_config, "permeability", 1.0) if soil_config else 1.0
-    eps_r = getattr(soil_config, "permittivity", 10.0) if soil_config else 10.0
-
-    omega = 2.0 * np.pi * freq
-    mu_0 = 4.0 * np.pi * 1e-7
-    sigma = 1.0 / rho
-    gamma_soil = np.sqrt(1j * omega * mu_0 * mu_r_soil * sigma - omega**2 * mu_0 * mu_r_soil * eps_r * 8.854e-12)
+    rho, mu_r_soil, eps_r, gamma_soil = resolve_soil_params(freq, soil_config)
 
     Z_matrix = _compute_Z(freq, cable, gamma_soil)
     P_matrix = _compute_P(freq, cable)
