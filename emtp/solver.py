@@ -156,6 +156,7 @@ from emtp.registry import SimulationRegistry, ElementRecord, SourceRecord, Multi
 from emtp.probes import ProbeManager
 from emtp.rhs import RHSEngine
 from emtp.kernel import MNAKernel
+from emtp.runtime.event_runtime import EventRuntime
 from emtp.results import (                                # noqa: E402
     scale_probe_values,
     scale_values,
@@ -364,6 +365,9 @@ class EMTPSolver:
 
         # ---- MNA Kernel (PR5) ----
         self.kernel = MNAKernel(self)
+
+        # ---- Event Runtime (PR6) ----
+        self.event_runtime = EventRuntime(self)
 
         # ---- 轻量探针记录 ----
         # 只记录用户指定的节点/支路波形，避免开启全量 history。
