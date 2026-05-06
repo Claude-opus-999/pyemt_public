@@ -135,3 +135,61 @@ class TestPipeTypePotentialToAdmittance:
         P = np.stack([np.eye(4), np.eye(4)])
         with pytest.raises(ValueError, match="shape mismatch"):
             _potential_to_admittance(freq, P, 3)
+
+
+class TestMultiArmoredAdmittance:
+    def test_single_cable_Y_shape(self):
+        from pylcp.generation.multi_armored_cable import (
+            _compute_multi_armored_admittance,
+        )
+
+        freq = np.array([50.0, 100.0])
+        cables = [object()]
+
+        class FakeCableModel:
+            @staticmethod
+            def compute_armored_cable_admittance(freq, cable):
+                return np.ones((len(freq), 3, 3), dtype=complex)
+
+        Y = _compute_multi_armored_admittance(freq, cables, FakeCableModel)
+        assert Y.shape == (2, 3, 3)
+
+    def test_two_cables_block_diagonal(self):
+        from pylcp.generation.multi_armored_cable import (
+            _compute_multi_armored_admittance,
+        )
+
+        freq = np.array([50.0])
+        cables = [object(), object()]
+
+        class FakeCableModel:
+            @staticmethod
+            def compute_armored_cable_admittance(freq, cable):
+                return np.ones((len(freq), 3, 3), dtype=complex)
+
+        Y = _compute_multi_armored_admittance(freq, cables, FakeCableModel)
+        assert Y.shape == (1, 6, 6)
+
+        # Off-diagonal blocks must be zero
+        assert np.allclose(Y[:, 0:3, 3:6], 0)
+        assert np.allclose(Y[:, 3:6, 0:3], 0)
+
+        # Diagonal blocks are non-zero
+        assert np.allclose(Y[:, 0:3, 0:3], 1)
+        assert np.allclose(Y[:, 3:6, 3:6], 1)
+
+    def test_rejects_bad_shape(self):
+        from pylcp.generation.multi_armored_cable import (
+            _compute_multi_armored_admittance,
+        )
+
+        freq = np.array([50.0])
+        cables = [object()]
+
+        class BadCableModel:
+            @staticmethod
+            def compute_armored_cable_admittance(freq, cable):
+                return np.ones((len(freq), 2, 2), dtype=complex)
+
+        with pytest.raises(ValueError, match="Unexpected admittance shape"):
+            _compute_multi_armored_admittance(freq, cables, BadCableModel)
