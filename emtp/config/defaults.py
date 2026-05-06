@@ -7,6 +7,7 @@ SUPPORTED_ELEMENTS = {
     "series_rl",
     "switch",
     "bergeron_line",
+    "ulm_line",
     "lpm_insulator",
     "moa_arrester",
     "umec_transformer",
