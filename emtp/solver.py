@@ -1740,6 +1740,27 @@ class EMTPSolver:
         -------
         ULMLine
         """
+        # -- length consistency -------------------------------------------
+        if generate_fitulm:
+            if lcp_spec is None:
+                raise ValueError(
+                    "lcp_spec is required when generate_fitulm=True"
+                )
+            lcp_length = float(lcp_spec.length)
+            solver_length = float(length)
+            if abs(solver_length - lcp_length) > 1e-9 * max(1.0, abs(lcp_length)):
+                raise ValueError(
+                    f"length mismatch: add_ULM_line length={solver_length}, "
+                    f"lcp_spec.length={lcp_length}. "
+                    "When generate_fitulm=True, omit length or pass the same value."
+                )
+            length = lcp_length
+        else:
+            if length is None:
+                raise ValueError(
+                    "length is required when generate_fitulm=False"
+                )
+
         spec = FitULMSpec(
             name=name,
             generate_fitulm=generate_fitulm,

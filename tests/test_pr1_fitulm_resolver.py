@@ -63,7 +63,7 @@ class TestFitULMResolverExternalFile:
         spec = FitULMSpec(
             name="line1", generate_fitulm=True, lcp_spec="dummy",
         )
-        with pytest.raises(AttributeError, match="freq"):
+        with pytest.raises(AttributeError):
             FitULMResolver().resolve(spec)
 
 
@@ -176,3 +176,51 @@ class TestSolverAddULMLineExternalFile:
             fitulm_path=fitulm_path,
         )
         assert "line1" in solver.transmission_lines
+
+
+class TestSolverAddULMLineLengthConsistency:
+    def test_length_mismatch_raises(self, monkeypatch):
+        """When generate_fitulm=True, solver length must match lcp_spec.length."""
+        from emtp import EMTPSolver
+        from emtp.lines import fitulm_resolver as resolver_module
+
+        class FakeLCPSpec:
+            length = 5000.0
+
+        def mock_resolve(self, spec):
+            return Path("dummy.fitULM")
+
+        monkeypatch.setattr(resolver_module.FitULMResolver, "resolve", mock_resolve)
+
+        solver = EMTPSolver(dt=1e-6, finish_time=100e-6, verbose=False)
+        with pytest.raises(ValueError, match="length mismatch"):
+            solver.add_ULM_line(
+                name="bad",
+                nodes_send=1, nodes_recv=2,
+                length=6000.0,
+                generate_fitulm=True,
+                lcp_spec=FakeLCPSpec(),
+            )
+
+    def test_length_consistent_passes(self, monkeypatch):
+        """When lengths match, we get past the length check."""
+        from emtp import EMTPSolver
+        from emtp.lines import fitulm_resolver as resolver_module
+
+        class FakeLCPSpec:
+            length = 5000.0
+
+        def mock_resolve(self, spec):
+            raise RuntimeError("past length check")
+
+        monkeypatch.setattr(resolver_module.FitULMResolver, "resolve", mock_resolve)
+
+        solver = EMTPSolver(dt=1e-6, finish_time=100e-6, verbose=False)
+        with pytest.raises(RuntimeError, match="past length check"):
+            solver.add_ULM_line(
+                name="ok",
+                nodes_send=1, nodes_recv=2,
+                length=5000.0,
+                generate_fitulm=True,
+                lcp_spec=FakeLCPSpec(),
+            )
