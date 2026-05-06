@@ -1,6 +1,6 @@
 # PyEMTP 架构文档
 
-版本 `v0.3.2` · 2026-05-06 · **289 passed, 3 skipped**
+版本 `v0.3.3` · 2026-05-06 · **309 passed, 3 skipped**
 
 ---
 
@@ -71,7 +71,7 @@ emtp_v0.2/
 ├── LCP/                                           # Layer 4: 线路常数物理引擎 (12 .py)
 ├── pylcp/                                         # Layer 4: LCP Python 包装层 (10 .py)
 ├── emtp/                                          # 主求解器包 (56 .py)
-├── tests/                                         # 测试套件 (40 .py, 289 passed)
+├── tests/                                         # 测试套件 (43 .py, 309 passed)
 └── cases/templates/                               # JSON 工况模板 (4 个)
 ```
 
@@ -118,7 +118,7 @@ from emtp.case_runner import run_case
 | 文件 | 行数 | 角色 |
 |------|------|------|
 | `emtp/__init__.py` | 17 | 惰性导出 `EMTPSolver`（`__getattr__`），避免循环导入 |
-| `emtp/solver.py` | ~3640 | **主求解器** — 完整的 MNA 瞬态仿真引擎。是系统最大单体，PLAN: PR2–PR7 拆分 |
+| `emtp/solver.py` | ~3660 | **主求解器** — 完整的 MNA 瞬态仿真引擎。是系统最大单体，PLAN: PR2–PR7 拆分。v0.3.3 新增 `add_ULM_line()` 方法支持 LCP 自动生成 |
 | `emtp/types.py` | ~120 | 共享类型 — `ElementType`, `Branch`, `VoltageSource`, `CurrentSource`, `LineData`, `ValidationIssue/Report`, `RHSPlan` |
 | `emtp/nodes.py` | ~80 | `NodeIndexer`（紧凑整数→稀疏矩阵行映射）+ `NodeBook`（命名节点注册） |
 | `emtp/circuit.py` | ~60 | `CircuitModel` dataclass — 独立于求解器的电路拓扑容器 |
@@ -130,7 +130,7 @@ from emtp.case_runner import run_case
 
 - `solver.py` 单向导入 Layer 0 库和 Layer 2 子包模块（v0.3.1 已清理历史遗留的三层 try/except 回退链）
 - `emtp/__init__.py` 惰性导出 `EMTPSolver`（避免了 `__init__` 阶段触发 solver 内所有 Layer 0 导入）
-- `emtp/solver.py` 仍是 ~3640 行大单体，计划在后续 PR2–PR7 中拆分为 kernel/runtime/registry
+- `emtp/solver.py` 仍是 ~3660 行大单体，计划在后续 PR2–PR7 中拆分为 kernel/runtime/registry
 
 ---
 
@@ -177,7 +177,7 @@ from emtp.case_runner import run_case
 
 | 文件 | 角色 |
 |------|------|
-| `fitulm_resolver.py` | **v0.3.2 新增** — `FitULMSpec` + `FitULMResolver`：外部文件校验 / LCP 自动生成分发 |
+| `fitulm_resolver.py` | **v0.3.2 新增** — `FitULMSpec` + `FitULMResolver`：外部文件校验 / LCP 自动生成 / 内容 hash 缓存 / `cache_dir` 传播 |
 | `bergeron.py` | `BergeronLineDevice` — Bergeron 线 `MultiPortDevice` 适配器 |
 | `ulm.py` | `ULMLineDevice` — ULM 线 `MultiPortDevice` 适配器 |
 
@@ -266,9 +266,9 @@ LCP/
 ```
 vectfit3.py          ← VF 底层引擎，无 LCP 内依赖
   ↑
-vf_core.py           ← VF 适配层，导入 vectfit3
+vf_core.py           ← VF 适配层，导入 .vectfit3
   ↑
-vector_fitting_v411_independent.py  ← ULM 完整拟合 + fitULM 读写，导入 vf_core
+vector_fitting_v411_independent.py  ← ULM 完整拟合 + fitULM 读写，导入 .vf_core
 ```
 
 `cable_model.py` 和 `ulm_atp_zy_deri_semlyen.py` 为 Z/Y 计算引擎，各自独立，无 LCP 内依赖。
@@ -296,9 +296,42 @@ pylcp/
 └── generation/
     ├── __init__.py
     ├── ohl_deri_semlyen.py          # 架空线 Z/Y
-    ├── pipe_type_cable.py           # 管型电缆 Z/Y
-    └── multi_armored_cable.py       # 多回铠装电缆 Z/Y
+    ├── pipe_type_cable.py           # 管型电缆 Z/Y (兼容 2D/3D P_matrix)
+    └── multi_armored_cable.py       # 多回铠装电缆 Z/Y (块对角 Y 组装)
 ```
+
+### cache.py — 内容 hash 缓存
+
+```python
+# 缓存路径: .lcp_cache/{name}_{hash}.fitULM
+# hash 覆盖：schema_version + pylcp_version + lcp_version
+#           + line_type + length + freq_hash
+#           + geometry_config + soil_config + vf_config
+#           + precision + use_freq_dependent + enforce_passivity
+```
+
+- `compute_cache_key(spec)` — 对所有影响 fitULM 结果的因素做 SHA-256 取前 16 位
+- `get_cache_path(spec)` — 返回 `{cache_dir}/{name}_{key}.fitULM`
+- 版本字段 (`schema_version=2`, `pylcp_version`, `lcp_version`) 确保升级后旧缓存自动失效
+- `_get_output_path()` 无条件使用外层 `FitULMSpec.cache_dir`（覆盖 lcp_spec 默认值）
+- `lcp_spec.output_path` 显式设置时优先级最高
+
+### fitulm_resolver.py — fitULM 文件校验与解析
+
+```
+FitULMResolver.resolve(spec)
+  │
+  ├─ _resolve_external_file() → _verify_fitulm() → path
+  └─ _resolve_from_lcp()
+       ├─ _get_output_path() → cache_dir 传播 → get_cache_path()
+       ├─ 缓存命中 + 未过期 → _verify_fitulm() → return
+       └─ 否则 → LCPFitULMGenerator.generate() → _verify_fitulm() → return
+```
+
+关键修复 (v0.3.3):
+- `_verify_fitulm()` 只捕获 `ImportError`（LCP 不可用），不吞 `Exception`
+- `_resolve_external_file()` 也调用 `_verify_fitulm()`，坏文件不会抵达 solver
+- `_get_output_path()` 无条件用外层 `cache_dir` 覆盖 lcp_spec 默认值
 
 ### ULM 线路接入 — 两条路径
 
@@ -314,7 +347,7 @@ solver.add_ULM_line(
 )
 ```
 
-**路径 B：LCP 自动生成**（从几何参数生成 fitULM）
+**路径 B：LCP 自动生成**（从几何参数生成 fitULM，length 可省略）
 
 ```python
 from pylcp import LCPLineType, LCPFitULMSpec
@@ -326,31 +359,44 @@ lcp_spec = LCPFitULMSpec(
     geometry_config=line_geometry,
 )
 
+# length 可省略 — 自动使用 lcp_spec.length
 solver.add_ULM_line(
     name="ohl_line",
     nodes_send=[1, 2], nodes_recv=[101, 102],
-    length=20000.0,
     generate_fitulm=True,
     lcp_spec=lcp_spec,
 )
 ```
+
+**length 语义**:
+
+| 模式 | length 参数 | 行为 |
+|------|------------|------|
+| `generate_fitulm=True` | 省略 | 使用 `lcp_spec.length` |
+| `generate_fitulm=True` | 与 `lcp_spec.length` 一致 | 通过 |
+| `generate_fitulm=True` | 与 `lcp_spec.length` 不一致 | `ValueError("length mismatch")` |
+| `generate_fitulm=False` | 必须显式传入 | 直接使用 |
 
 **内部链路**:
 
 ```
 solver.add_ULM_line(...)
         │
+        ├─ length 一致性校验 (generate_fitulm=True 时强制)
+        │
         ▼
 FitULMResolver.resolve(spec)
         │
   ┌─────┴──────┐
   │ 外部文件      │  LCP 自动生成
-  │ 校验路径/非空  │   │
+  │ verify→path   │   │
   └──────┬──────┘   ▼
          │    LCPFitULMGenerator.generate()
          │      ├── compute_zy()     → Z/Y 矩阵
          │      ├── ulm_complete_fitting() → VF 拟合
          │      └── write_fitULM()   → fitULM 文件 + verify
+         │              │
+         │              └── get_cache_path(spec)  → {name}_{hash}.fitULM
          │
          ▼
   solver.add_ulm_line(fitulm_file=path)
@@ -412,7 +458,9 @@ LCPFitULMGenerator.generate()
   ├─ 2. compute_zy()                    pylcp/generation/
   │     ├─ OHL:      compute_ohl_zy()     → Z/Y via Deri-Semlyen
   │     ├─ PIPE:     compute_pipe_type_cable_zy() → Z/Y via Ametani
+  │     │              └─ _potential_to_admittance()  2D/3D P_matrix 兼容
   │     └─ ARMORED:  compute_multi_armored_cable_zy() → Z/Y
+  │                    └─ _compute_multi_armored_admittance()  块对角 Y
   │
   ├─ 3. validate_zy_matrices()          pylcp/validation.py
   │
@@ -430,8 +478,10 @@ LCPFitULMGenerator.generate()
 ## 测试体系
 
 ```
-289 passed, 3 skipped
+309 passed, 3 skipped
+```
 
+```
 tests/
 ├── test_basic_mna.py               # MNA 基本装配
 ├── test_trapezoidal_rlc.py         # 梯形法 RLC
@@ -457,13 +507,14 @@ tests/
 ├── test_fixes_min_max_chunk_snapshot.py  # 修复验证
 ├── test_solver_regression.py       # 求解器回归 (38 tests)
 │
-├── test_baseline_lcp_emtp.py       # ★ PR-0: LCP 模块可达性 + fitULM API
-├── test_pr1_fitulm_resolver.py     # ★ PR-1: FitULMResolver 外部文件模式
+├── test_baseline_lcp_emtp.py       # ★ LCP 模块可达性 + fitULM API + 语法检查
+├── test_pr1_fitulm_resolver.py     # ★ FitULMResolver + add_ULM_line 全接口
 │
-└── pylcp_tests/                    # ★ PR-2~7: pylcp 集成测试
-    ├── test_pr2_generation.py       # Z/Y 生成 + 校验
+└── pylcp_tests/                    # ★ LCP 集成测试
+    ├── test_pr2_generation.py       # Z/Y 生成 + P_matrix 2D/3D + Y 块对角
     ├── test_pr3_generator.py        # LCPFitULMGenerator 管线
-    └── test_pr67_integration.py     # 缓存 + E2E 求解器仿真
+    ├── test_cache.py                # 内容 hash 缓存 + 版本字段 + cache_dir 传播
+    └── test_pr67_integration.py     # 缓存复用 + E2E 求解器仿真
 ```
 
 ---
@@ -480,6 +531,8 @@ tests/
 | v0.3.1 | `52b87f8` | Bugfix: run_id 字符串路径；PR1: 删除旧 API 垫片 |
 | v0.3.1 | `a487e0f` | Cleanup: 删除死代码/旧测试/空框架 (-10,771 行) |
 | v0.3.2 | `866e210` | **LCP 集成**: fitULM 自动生成, solver.add_ULM_line(), pylcp 包 |
+| v0.3.2 | `200d879`→`56f3d43` | **P0 修复 x6**: 语法检查 / verify 不吞异常 / hash 缓存 / length 一致性 / P_matrix 2D-3D / Y 块对角 |
+| v0.3.3 | `19acfa0`→`735cfdf` | **严格验收 x2**: cache key 版本字段 + cache_dir 传播 / length 默认 None 语义 |
 
 ---
 
@@ -487,7 +540,7 @@ tests/
 
 | # | 问题 | 位置 | 计划 |
 |---|------|------|------|
-| 1 | `solver.py` ~3640 行单体 | `emtp/solver.py` | PR2–PR7 内核重构 |
+| 1 | `solver.py` ~3660 行单体 | `emtp/solver.py` | PR2–PR7 内核重构 |
 | 2 | 仿真对象状态分散在多个并行容器 | `emtp/solver.py` | PR2: SimulationRegistry |
 | 3 | 探针和结果逻辑嵌入 solver | `emtp/solver.py` | PR3: ProbeManager |
 | 4 | RHS 构建/电源预采样未独立 | `emtp/solver.py` | PR4: RHS Engine |
