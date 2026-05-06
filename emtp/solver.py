@@ -154,6 +154,7 @@ from emtp.lines.fitulm_resolver import FitULMSpec, FitULMResolver
 from emtp.transformers.umec import UMECTransformerDevice
 from emtp.registry import SimulationRegistry, ElementRecord, SourceRecord, MultiPortRecord
 from emtp.probes import ProbeManager
+from emtp.rhs import RHSEngine
 from emtp.results import (                                # noqa: E402
     scale_probe_values,
     scale_values,
@@ -356,6 +357,9 @@ class EMTPSolver:
 
         # ---- 探针管理 (PR3) ----
         self.probe_manager = ProbeManager()
+
+        # ---- RHS 引擎 (PR4) ----
+        self.rhs_engine = RHSEngine(self)
 
         # ---- 轻量探针记录 ----
         # 只记录用户指定的节点/支路波形，避免开启全量 history。
@@ -2218,8 +2222,8 @@ class EMTPSolver:
             self._rhs_plan = self._compile_rhs_plan()
             self._rhs_plan_dirty = False
 
-        rhs = (self._build_rhs_fast() if self.use_rhs_plan
-               else self._build_MNA_rhs())
+        rhs = (self.rhs_engine.build_fast() if self.use_rhs_plan
+               else self.rhs_engine.build())
 
         return self._cached_MNA, rhs
 
