@@ -69,7 +69,7 @@ def run_case(
         config_path = Path(config_or_path)
 
     run_id = run_id or make_run_id(
-        config_or_path.stem if isinstance(config_or_path, Path)
+        config_path.stem if config_path is not None
         else getattr(config_or_path, "case_name", "case")
     )
     result_dir = Path(output_dir) if output_dir else None

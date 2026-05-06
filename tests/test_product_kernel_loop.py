@@ -106,6 +106,15 @@ class TestRunCaseDatabase:
         assert result.success
         assert result.metadata["run_id"].startswith("rc_step_")
 
+    def test_auto_generates_run_id_from_string_path(self, tmp_path):
+        """run_case with a str path must derive run_id from the filename stem."""
+        db_path = tmp_path / "test.sqlite"
+        result = run_case(
+            str(CASES_DIR / "rc_step.json"), db_path=db_path,
+        )
+        assert result.success
+        assert result.metadata["run_id"].startswith("rc_step_")
+
     def test_overwrite_false_raises(self, tmp_path):
         tmp_path.mkdir(exist_ok=True)
         run_case(CASES_DIR / "rc_step.json", output_dir=tmp_path)
