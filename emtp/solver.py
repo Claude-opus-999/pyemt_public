@@ -1702,7 +1702,7 @@ class EMTPSolver:
         nodes_send: Union[int, List[int]],
         nodes_recv: Union[int, List[int]],
         *,
-        length: float = 1.0,
+        length: Optional[float] = None,
         generate_fitulm: bool = False,
         fitulm_path=None,
         lcp_spec=None,
@@ -1721,7 +1721,10 @@ class EMTPSolver:
         nodes_recv:
             Receiving-end node(s).  Same rules as *nodes_send*.
         length:
-            Line length in metres.
+            Line length in metres.  When *generate_fitulm* is True,
+            *lcp_spec.length* is the authoritative source — omit
+            *length* or pass the same value.  Required when
+            *generate_fitulm* is False.
         generate_fitulm:
             When False (default), read from an existing *fitulm_path*.
             When True, generate a fitULM file via LCP from *lcp_spec*.
@@ -1740,26 +1743,29 @@ class EMTPSolver:
         -------
         ULMLine
         """
-        # -- length consistency -------------------------------------------
+        # -- length resolution --------------------------------------------
         if generate_fitulm:
             if lcp_spec is None:
                 raise ValueError(
                     "lcp_spec is required when generate_fitulm=True"
                 )
             lcp_length = float(lcp_spec.length)
-            solver_length = float(length)
-            if abs(solver_length - lcp_length) > 1e-9 * max(1.0, abs(lcp_length)):
-                raise ValueError(
-                    f"length mismatch: add_ULM_line length={solver_length}, "
-                    f"lcp_spec.length={lcp_length}. "
-                    "When generate_fitulm=True, omit length or pass the same value."
-                )
+            if length is not None:
+                solver_length = float(length)
+                if abs(solver_length - lcp_length) > 1e-9 * max(1.0, abs(lcp_length)):
+                    raise ValueError(
+                        f"length mismatch: add_ULM_line length={solver_length}, "
+                        f"lcp_spec.length={lcp_length}. "
+                        "When generate_fitulm=True, lcp_spec.length is the "
+                        "authoritative length — omit length or pass the same value."
+                    )
             length = lcp_length
         else:
             if length is None:
                 raise ValueError(
                     "length is required when generate_fitulm=False"
                 )
+            length = float(length)
 
         spec = FitULMSpec(
             name=name,

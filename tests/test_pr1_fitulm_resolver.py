@@ -224,3 +224,49 @@ class TestSolverAddULMLineLengthConsistency:
                 generate_fitulm=True,
                 lcp_spec=FakeLCPSpec(),
             )
+
+    def test_omits_length_uses_lcp_spec_length(self, monkeypatch):
+        """When generate_fitulm=True and length omitted, use lcp_spec.length."""
+        from emtp import EMTPSolver
+        from emtp.lines import fitulm_resolver as resolver_module
+
+        class FakeLCPSpec:
+            length = 5000.0
+
+        def mock_resolve(self, spec):
+            raise RuntimeError("past length check")
+
+        monkeypatch.setattr(resolver_module.FitULMResolver, "resolve", mock_resolve)
+
+        solver = EMTPSolver(dt=1e-6, finish_time=100e-6, verbose=False)
+        with pytest.raises(RuntimeError, match="past length check"):
+            solver.add_ULM_line(
+                name="ok",
+                nodes_send=1, nodes_recv=2,
+                generate_fitulm=True,
+                lcp_spec=FakeLCPSpec(),
+            )
+
+    def test_generate_fitulm_true_requires_lcp_spec(self):
+        from emtp import EMTPSolver
+
+        solver = EMTPSolver(dt=1e-6, finish_time=100e-6, verbose=False)
+        with pytest.raises(ValueError, match="lcp_spec is required"):
+            solver.add_ULM_line(
+                name="bad",
+                nodes_send=1, nodes_recv=2,
+                generate_fitulm=True,
+            )
+
+    def test_external_fitulm_requires_length(self):
+        """generate_fitulm=False with no length must raise."""
+        from emtp import EMTPSolver
+
+        solver = EMTPSolver(dt=1e-6, finish_time=100e-6, verbose=False)
+        with pytest.raises(ValueError, match="length is required"):
+            solver.add_ULM_line(
+                name="bad",
+                nodes_send=1, nodes_recv=2,
+                generate_fitulm=False,
+                fitulm_path="nonexistent.fitULM",
+            )
