@@ -2,7 +2,7 @@
 
 基于 Python 的电磁暂态（EMTP）仿真求解器。使用修正节点分析法（MNA）进行电路求解，集成多相传输线、非线性元件、UMEC 变压器和绝缘子闪络模型。
 
-**当前版本**: `v0.3.0` (commit `6d77ab8`) · **测试**: 205 passed, 3 skipped · **Python**: 3.12+ · **依赖**: numpy, scipy
+**当前版本**: `v0.3.1` (commit `52b87f8`) · **测试**: 248 passed, 3 skipped · **Python**: 3.12+ · **依赖**: numpy, scipy
 
 ---
 
@@ -268,7 +268,7 @@ solver = EMTPSolver(
 
 ```bash
 pytest tests/ -q --ignore=tests/test_tower_case_p1.py
-# 205 passed, 3 skipped
+# 248 passed, 3 skipped
 ```
 
 | 分类 | 测试文件 | 覆盖 |
@@ -281,6 +281,8 @@ pytest tests/ -q --ignore=tests/test_tower_case_p1.py
 | 配置层 | `test_case_config` (22 tests) | load/validate/build/run_case |
 | 快照 | `test_snapshot` (6 tests) | save/load/run_until/resume equivalence |
 | 导出 | `test_export_and_db` (18 tests) | NPZ/JSON/stride/chunk/SQLite |
+| 闭环 | `test_product_kernel_loop` (26 tests) | run_case → export → db → snapshot safety |
+| 修复验证 | `test_fixes_min_max_chunk_snapshot` (17 tests) | DB min/max, 2D chunk, Bergeron state_dict, resume equivalence |
 
 ---
 
@@ -315,6 +317,7 @@ emtp/solver.py
 | v0.2.1 | `f42404b` | PR-10~17：ResultStore 接入、Multiport registry、Bergeron/ULM/UMEC adapter 注册、ResolveEvent、MNAAssembler (154 tests) |
 | v0.2.2 | `cf8b7dc` | PR-18~19：TimeStepper 主循环、CircuitModel 容器 (159 tests) |
 | v0.3.0 | `6d77ab8` | Case/Config 层、Snapshot/Resume、结果降采样导出、SQLite 数据库 (205 tests) |
+| v0.3.1 | `52b87f8` | Bugfix: run_id 字符串路径生成；补测：DB min/max、2D chunk、Bergeron state_dict、resume 等价 (248 tests) |
 
 ---
 
