@@ -1,5 +1,6 @@
 """PR-0: Baseline tests — LCP modules are importable and key APIs exist."""
 
+import py_compile
 import sys
 from pathlib import Path
 
@@ -137,3 +138,18 @@ class TestEMTPULMPipeline:
         reader = FitULMReader(str(fitulm_path))
         fit_data = reader.read()
         assert fit_data.nf == 1
+
+
+class TestAllNewFilesCompile:
+    def test_lcp_and_resolver_python_files_compile(self):
+        """Every .py file in pylcp/ and fitulm_resolver.py must compile clean."""
+        from pathlib import Path
+
+        files = [
+            *sorted(Path("pylcp").glob("*.py")),
+            *sorted(Path("pylcp/generation").glob("*.py")),
+            Path("emtp/lines/fitulm_resolver.py"),
+        ]
+
+        for file in files:
+            py_compile.compile(str(file), doraise=True)
