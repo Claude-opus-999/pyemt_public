@@ -1,197 +1,53 @@
-# PyEMTP 架构梳理
+# PyEMTP 架构文档
 
-版本 `v0.3.1` · PR1+cleanup · 2026-05-06
+版本 `v0.3.2` · 2026-05-06 · **289 passed, 3 skipped**
+
+---
+
+## 目录
+
+1. [整体分层架构](#整体分层架构)
+2. [根目录文件清单](#根目录文件清单)
+3. [Layer 0: 外部物理库](#layer-0-外部物理库)
+4. [Layer 1: 核心求解器 (emtp/)](#layer-1-核心求解器-emtp)
+5. [Layer 2: 模块化子包](#layer-2-模块化子包)
+6. [Layer 3: 高层管线](#layer-3-高层管线)
+7. [Layer 4: LCP 线路常数计算](#layer-4-lcp-线路常数计算)
+8. [数据流](#数据流)
+9. [测试体系](#测试体系)
+10. [版本历程](#版本历程)
+11. [已知技术债](#已知技术债)
 
 ---
 
 ## 整体分层架构
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Layer 3: 高层管线 (v0.3 新增)                            │
-│  config/ builders/ snapshot/ export/                      │
-│  case_runner.py result_bundle.py result_db.py run_id.py   │
-├─────────────────────────────────────────────────────────┤
-│  Layer 2: 模块化子包                                      │
-│  devices/ assembly/ runtime/ results/                     │
-│  lines/ transformers/ sources/ nonlinear/                 │
-├─────────────────────────────────────────────────────────┤
-│  Layer 1: 核心求解器 (emtp/)                               │
-│  solver.py types.py nodes.py circuit.py                   │
-│  sparse_solver.py stamping.py validation.py               │
-├─────────────────────────────────────────────────────────┤
-│  Layer 0: 外部物理库 (顶层 .py)                            │
-│  transmission_line_emtp_v2.py  ulm_transmission_line_PARA.py │
-│  nonlinear_models_pscad.py  umec_transformer.py            │
-│  atp_lightning_current_generator_simplified.py             │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  Layer 4: 线路常数计算 (LCP)           ← v0.3.2 新增      │
+│  LCP/  (物理引擎)  +  pylcp/  (Python 包装层)             │
+├──────────────────────────────────────────────────────────┤
+│  Layer 3: 高层管线 (v0.3 新增)                             │
+│  config/ builders/ snapshot/ export/                       │
+│  case_runner.py result_bundle.py result_db.py run_id.py    │
+├──────────────────────────────────────────────────────────┤
+│  Layer 2: 模块化子包                                       │
+│  devices/ assembly/ runtime/ results/                      │
+│  lines/ (fitulm_resolver, bergeron, ulm)                   │
+│  transformers/ sources/ nonlinear/                         │
+├──────────────────────────────────────────────────────────┤
+│  Layer 1: 核心求解器 (emtp/)                                │
+│  solver.py types.py nodes.py circuit.py                    │
+│  sparse_solver.py stamping.py validation.py                │
+├──────────────────────────────────────────────────────────┤
+│  Layer 0: 外部物理库 (顶层 .py 文件)                        │
+│  transmission_line_emtp_v2.py   ulm_transmission_line_PARA.py │
+│  nonlinear_models_pscad.py      umec_transformer.py          │
+│  atp_lightning_current_generator_simplified.py               │
+└──────────────────────────────────────────────────────────┘
 ```
 
-**依赖方向**: Layer 3 → Layer 2 → Layer 1 → Layer 0（单向，上层依赖下层）
-
----
-
-## Layer 0: 外部物理库（顶层 .py 文件）
-
-五个体积大、独立自足的物理模型库。**仅依赖 numpy/scipy/numba/stdlib，相互之间无交叉依赖**，也不依赖 `emtp/` 包内的任何模块。
-
-| 文件 | 行数 | 功能 | 导出 |
-|------|------|------|------|
-| `transmission_line_emtp_v2.py` | 381 | 无损 Bergeron 恒参数传输线模型 | `BergeronLine`, `DelayBuffer`, `TransmissionLineInterface`, `LineCalculator`, `TransmissionLineFactory` |
-| `ulm_transmission_line_PARA.py` | 2540 | ULM 频变传输线，含 Numba JIT 加速 | `FitULMData`, `FitULMReader`, `ULMModel`, `ULMLine`, `ULMBatchPack` |
-| `nonlinear_models_pscad.py` | 765 | PSCAD 风格分段 MOA 电阻 + CIGRE LPM 闪络 | `SegmentedMOAResistor`, `InsulatorFlashoverLPM`, `SegmentedSolverHelper`, `NonlinearResistorModel` |
-| `umec_transformer.py` | 766 | UMEC 三相变压器模型（含饱和） | `UMECTransformer`, `UMECTransformerData`, `UMECSaturationModel`, `WindingType` |
-| `atp_lightning_current_generator_simplified.py` | 1058 | ATP 兼容雷电电流源（双指数 + Heidler） | `TWOEXPFCurrentSource`, `HEIDLERFCurrentSource`, `LightningWaveform`, 工厂函数 |
-
-**状态**: 这五个文件是项目的物理核心，必须保留。它们由 `emtp/` 内的 wrapper 子包按需导入（try/except + `None` 回退）。
-
----
-
-## Layer 1: 核心求解器
-
-`emtp/` 包内的根级模块，构成 MNA 瞬态仿真引擎的主体。
-
-| 文件 | 行数 | 角色 |
-|------|------|------|
-| `emtp/solver.py` | ~3640 | **主求解器** — `EMTPSolver` 类。完整的 MNA 瞬态仿真引擎，包含多相线路、非线性 MOA、UMEC 变压器、LPM 闪络。是系统中最大的单体文件 |
-| `emtp/types.py` | ~120 | 共享数据类型 — `ElementType` 枚举, `Branch`/`VoltageSource`/`CurrentSource` dataclass, `LineData`, `ValidationIssue`/`ValidationReport`, `RHSPlan` |
-| `emtp/nodes.py` | ~80 | `NodeIndexer`（紧凑整数索引映射）和 `NodeBook`（命名节点注册表） |
-| `emtp/circuit.py` | ~60 | `CircuitModel` dataclass — 分支/设备/电源/线路/变压器/节点的独立数据容器，与求解器解耦 |
-| `emtp/sparse_solver.py` | ~80 | `SparseLinearSolver` — 封装 `scipy.sparse.linalg.splu` (SuperLU)，带 LU 分解缓存 |
-| `emtp/stamping.py` | ~120 | `COOStamper`（三元组累加器，构建稀疏 G 矩阵）+ `StampingEngine`（管理装配生命周期） |
-| `emtp/validation.py` | ~40 | 拓扑/参数/内存校验，返回 `ValidationReport` |
-
-**关键关系**:
-- `solver.py` 通过 `emtp.types`、`emtp.sources` 等子包导入所需符号（v0.3.1 已清理历史遗留的三层 try/except 导入回退链）
-- `emtp/__init__.py` 通过 `__getattr__` 惰性导出 `EMTPSolver`，避免循环导入
-
----
-
-## Layer 2: 模块化子包
-
-### devices/ — 分支元件物理实现
-
-| 文件 | 角色 |
-|------|------|
-| `base.py` | `Device` Protocol — 二端元件的抽象接口：`stamp_G`, `stamp_rhs`, `update_branch_quantities`, `update_history` |
-| `multiport.py` | `MultiPortDevice` Protocol — 多端口元件的抽象接口（Bergeron/ULM/UMEC） |
-| `resistor.py` | `ResistorDevice` — 纯电阻，无历史项，恒定电导 |
-| `inductor.py` | `InductorDevice` — 梯形法离散：Geq = dt/(2L)，可选的并联阻尼 |
-| `capacitor.py` | `CapacitorDevice` — 梯形法离散：Geq = 2C/dt |
-| `switch.py` | `SwitchDevice` — 定时开/关，Ron/Roff 电导模型，触发拓扑重建 |
-| `series_rl.py` | `SeriesRLDevice` — 串联 RL，无内部节点的二端实现 |
-| `nonlinear.py` | `NonlinearResistorDevice` — PSCAD 风格分段 MOA，由 `SegmentedSolverHelper` 管理电导切换 |
-| `lpm.py` | `LPMFlashoverDevice` — CIGRE 先导发展法闪络开关 |
-
-### assembly/ — MNA 矩阵装配
-
-| 文件 | 角色 |
-|------|------|
-| `mna.py` | `MNAAssembler` — 构建 (n+m)×(n+m) 增广 MNA 系统矩阵 G 和 RHS 向量 |
-
-### runtime/ — 每步状态管理与重解循环
-
-| 文件 | 角色 |
-|------|------|
-| `__init__.py` | `DynamicDeviceRuntime` — 管理求解前的开关事件、求解后的分支 V/I 更新、历史项推进、LPM/UMEC/非线性后求解重解检查 |
-| `resolve.py` | `ResolveManager` + `ResolveEvent` — 统一的非线性/LPM/UMEC 重解循环，检测拓扑变化并触发矩阵重建 |
-| `stepper.py` | `TimeStepper` — 抽取的主时间步循环编排器，将每步物理通过 `_run_one_step` 委托回求解器 |
-
-### results/ — 结果检索与存储
-
-| 文件 | 角色 |
-|------|------|
-| `store.py` | `ResultStore` — 预分配缓冲区：时间数组、节点电压矩阵、电压源电流缓冲、探针存储 |
-| `__init__.py` | 辅助函数：`scale_probe_values`, `node_voltage_from_solution`, `branch_current_from_solution` 等 |
-
-### lines/ — 传输线适配器
-
-| 文件 | 角色 |
-|------|------|
-| `bergeron.py` | `BergeronLineDevice` — `MultiPortDevice` 适配器，将 Bergeron 线的对地端口和历史电流注入接入 MNA |
-| `ulm.py` | `ULMLineDevice` — `MultiPortDevice` 适配器，将频变 ULM 线接入 MNA |
-
-### transformers/ — 变压器适配器
-
-| 文件 | 角色 |
-|------|------|
-| `umec.py` | `UMECTransformerDevice` — `MultiPortDevice` 适配器，支持饱和驱动的矩阵重建 |
-
-### sources/ — 雷电电流源
-
-| 文件 | 角色 |
-|------|------|
-| `__init__.py` | 从 `atp_lightning_current_generator_simplified.py` 做 try/except 导入，导出 `TWOEXPFCurrentSource`, `HEIDLERFCurrentSource`, 工厂函数 |
-
-### nonlinear/ — 非线性元件 wrapper
-
-| 文件 | 角色 |
-|------|------|
-| `__init__.py` | 从 `nonlinear_models_pscad.py` 做 try/except 导入，导出 `SegmentedMOAResistor`, `InsulatorFlashoverLPM`, `SegmentedSolverHelper` |
-
----
-
-## Layer 3: 高层管线（v0.3 新增）
-
-### config/ — JSON 工况配置
-
-| 文件 | 角色 |
-|------|------|
-| `schema.py` | `CaseConfig` + `SimulationOptions` dataclass，定义完整配置模式 |
-| `loader.py` | `load_case_config()` — 加载 + 合并默认值 + 验证 JSON 工况文件 |
-| `validator.py` | `validate_case_config()` — 校验 dt/finish_time 正值、有效元件类型、唯一名称 |
-| `defaults.py` | `SUPPORTED_ELEMENTS`, `SUPPORTED_SOURCES`, `SUPPORTED_PROBES`, `DEFAULT_SIMULATION` |
-
-### builders/ — 配置→求解器构建
-
-| 文件 | 角色 |
-|------|------|
-| `solver_builder.py` | `build_solver_from_config()` — 从 `CaseConfig` 创建并配置 `EMTPSolver` |
-| `element_builder.py` | `add_element_to_solver()` — 按 `kind` 键分发元件 |
-| `source_builder.py` | `add_source_to_solver()` — 分发电源 |
-| `probe_builder.py` | `add_probe_to_solver()` — 分发探针 |
-
-### snapshot/ — 状态保存/恢复
-
-| 文件 | 角色 |
-|------|------|
-| `schema.py` | `SnapshotMetadata` dataclass |
-| `serializer.py` | `save_snapshot()` — 将求解器动态状态序列化到快照目录 |
-| `restore.py` | `load_snapshot_into_solver()` — 从快照目录恢复分支/线路/变压器动态状态 |
-| `hashing.py` | `compute_config_hash()` + `compute_topology_hash()` — SHA-256 哈希，用于快照完整性校验和拓扑变更检测 |
-
-### export/ — 结果导出
-
-| 文件 | 角色 |
-|------|------|
-| `waveform_exporter.py` | `export_waveforms_npz()` — NPZ + 波形元数据 JSON + stride 降采样；`read_waveform_chunk()` — 分块读取（前端友好） |
-| `metrics_exporter.py` | `export_metrics_json()` — 标量指标 → JSON |
-| `csv_exporter.py` | `export_waveforms_csv()` — 1-D 波形 → CSV |
-
-### 根级管线模块
-
-| 文件 | 行数 | 角色 |
-|------|------|------|
-| `emtp/case_runner.py` | 313 | `run_case()` — 高层入口：加载→构建→模拟→收集→导出→入库 |
-| `emtp/result_bundle.py` | 39 | `ResultBundle` dataclass — 结构化输出容器 |
-| `emtp/result_db.py` | 196 | `ResultDatabase` — SQLite 运行历史、指标、波形信号记录 |
-| `emtp/run_id.py` | 13 | `make_run_id()` — 生成唯一运行 ID |
-
----
-
-## v0.3.1 已删除的历史遗留内容
-
-PR1 + cleanup 已从仓库中删除以下内容：
-
-| 文件/目录 | 类型 | 删除原因 |
-|-----------|------|---------|
-| `emtp_solver_v3.py` | 兼容垫片 | 旧入口，全部 22 个引用文件已迁移到 `from emtp import EMTPSolver` |
-| `emtp_components_series_rl_only.py` | 兼容垫片 | `solver.py` 三层 try/except 导入链已清理，符号直接来自 `emtp.types` |
-| `emtp_plotting.py` | 死代码 | 全项目无 import，功能已被 `ResultStore` 替代 |
-| `test_lasted/` | 旧测试 | 6 个遗留验证脚本，与 `tests/` 重复，使用旧 API |
-| `validation/` | 空框架 | 仅 4 个工具脚本，`cases/` 和 `golden_results/` 子目录均空 |
-| `EMTP_SOLVER_ARCHITECTURE.md` | 旧文档 | 被本文档取代，大量引用已删除文件 |
-| `P3_P4_P5_IMPLEMENTATION_REPORT.md` | 历史报告 | 描述旧→新架构迁移过程，已无参考价值 |
+**依赖方向**: Layer 4 → Layer 3 → Layer 2 → Layer 1 → Layer 0（单向，上层依赖下层，绝不反向）
 
 ---
 
@@ -199,27 +55,315 @@ PR1 + cleanup 已从仓库中删除以下内容：
 
 ```
 emtp_v0.2/
-├── README.md                                    # 项目文档
-├── CLAUDE.md                                    # Claude Code 行为指南
-├── ARCHITECTURE.md                              # 架构文档
-├── API_MIGRATION.md                             # API 迁移指南
-├── DIRECTION_CONVENTIONS.md                     # 符号/单位/stamping 约定
+├── README.md                                     # 项目文档
+├── CLAUDE.md                                     # Claude Code 行为指南
+├── ARCHITECTURE.md                               # 架构文档（本文件）
+├── API_MIGRATION.md                              # 旧→新 API 迁移说明
+├── DIRECTION_CONVENTIONS.md                      # 符号/单位/stamping 约定
 ├── .gitignore
 │
-├── atp_lightning_current_generator_simplified.py # ✅ Layer 0: 雷电电流源
-├── transmission_line_emtp_v2.py                  # ✅ Layer 0: Bergeron 线
-├── ulm_transmission_line_PARA.py                 # ✅ Layer 0: ULM 线
-├── nonlinear_models_pscad.py                     # ✅ Layer 0: MOA + LPM
-├── umec_transformer.py                           # ✅ Layer 0: UMEC 变压器
+├── atp_lightning_current_generator_simplified.py  # Layer 0: 雷电电流源 (1058 行)
+├── transmission_line_emtp_v2.py                   # Layer 0: Bergeron 传输线 (381 行)
+├── ulm_transmission_line_PARA.py                  # Layer 0: ULM 频变传输线 (2540 行)
+├── nonlinear_models_pscad.py                      # Layer 0: MOA/LPM 非线性 (765 行)
+├── umec_transformer.py                            # Layer 0: UMEC 变压器 (766 行)
 │
-├── emtp/                                         # ✅ 主包（54 个 .py 文件）
-├── tests/                                        # ✅ 测试套件（248 passed, 3 skipped）
-└── cases/templates/                              # ✅ JSON 工况模板（4 个）
+├── LCP/                                           # Layer 4: 线路常数物理引擎 (12 .py)
+├── pylcp/                                         # Layer 4: LCP Python 包装层 (10 .py)
+├── emtp/                                          # 主求解器包 (56 .py)
+├── tests/                                         # 测试套件 (40 .py, 289 passed)
+└── cases/templates/                               # JSON 工况模板 (4 个)
 ```
 
 ---
 
-## 数据流：run_case() 全链路
+## v0.3.1–v0.3.2 已删除的旧内容
+
+| 文件/目录 | 删除原因 |
+|-----------|---------|
+| `emtp_solver_v3.py` | 旧入口垫片 — 22 个引用文件已全部迁移到 `from emtp import EMTPSolver` |
+| `emtp_components_series_rl_only.py` | 旧类型垫片 — solver.py 三层 try/except 导入链已清理 |
+| `emtp_plotting.py` | 死代码 — 全项目无任何 import 引用 |
+| `test_lasted/` | 旧测试 — 6 个遗留脚本，与 tests/ 功能重叠 |
+| `validation/` | 空框架 — cases/golden_results 子目录均空，仅 4 个工具脚本 |
+| `EMTP_SOLVER_ARCHITECTURE.md` | 旧文档 — 大量引用已删除的 emtp_solver_v3.py |
+| `P3_P4_P5_IMPLEMENTATION_REPORT.md` | 历史报告 — 描述旧→新架构迁移，已无参考价值 |
+
+---
+
+## Layer 0: 外部物理库
+
+五个大型自包含模块。仅依赖 numpy/scipy/numba/stdlib，相互无交叉依赖，不依赖 `emtp/` 包内任何模块。由 `emtp/` wrapper 子包通过 try/except + `None` 回退模式按需导入。
+
+| 文件 | 行数 | 用途 | 核心导出 |
+|------|------|------|---------|
+| `transmission_line_emtp_v2.py` | 381 | 无损 Bergeron 恒参数传输线 | `BergeronLine`, `DelayBuffer`, `TransmissionLineInterface` |
+| `ulm_transmission_line_PARA.py` | 2540 | ULM 频变传输线 + Numba JIT | `FitULMData`, `FitULMReader`, `ULMModel`, `ULMLine`, `ULMBatchPack` |
+| `nonlinear_models_pscad.py` | 765 | PSCAD 分段 MOA + CIGRE LPM 闪络 | `SegmentedMOAResistor`, `InsulatorFlashoverLPM`, `SegmentedSolverHelper` |
+| `umec_transformer.py` | 766 | UMEC 三相变压器（含饱和） | `UMECTransformer`, `UMECTransformerData`, `UMECSaturationModel` |
+| `atp_lightning_current_generator_simplified.py` | 1058 | ATP 兼容雷电电流源（双指数 + Heidler） | `TWOEXPFCurrentSource`, `HEIDLERFCurrentSource`, `LightningWaveform` |
+
+---
+
+## Layer 1: 核心求解器 (emtp/)
+
+`EMTPSolver` 是 MNA 瞬态仿真的主类。Layer 1 是 emtp/ 包内的根级模块。
+
+```python
+from emtp import EMTPSolver
+# 或
+from emtp.case_runner import run_case
+```
+
+| 文件 | 行数 | 角色 |
+|------|------|------|
+| `emtp/__init__.py` | 17 | 惰性导出 `EMTPSolver`（`__getattr__`），避免循环导入 |
+| `emtp/solver.py` | ~3640 | **主求解器** — 完整的 MNA 瞬态仿真引擎。是系统最大单体，PLAN: PR2–PR7 拆分 |
+| `emtp/types.py` | ~120 | 共享类型 — `ElementType`, `Branch`, `VoltageSource`, `CurrentSource`, `LineData`, `ValidationIssue/Report`, `RHSPlan` |
+| `emtp/nodes.py` | ~80 | `NodeIndexer`（紧凑整数→稀疏矩阵行映射）+ `NodeBook`（命名节点注册） |
+| `emtp/circuit.py` | ~60 | `CircuitModel` dataclass — 独立于求解器的电路拓扑容器 |
+| `emtp/sparse_solver.py` | ~80 | `SparseLinearSolver` — SuperLU 封装，LU 分解缓存 |
+| `emtp/stamping.py` | ~120 | `COOStamper`（三元组累加器）+ `StampingEngine`（MNA 装配生命周期） |
+| `emtp/validation.py` | ~40 | 拓扑/参数/内存校验 → `ValidationReport` |
+
+### 关键关系
+
+- `solver.py` 单向导入 Layer 0 库和 Layer 2 子包模块（v0.3.1 已清理历史遗留的三层 try/except 回退链）
+- `emtp/__init__.py` 惰性导出 `EMTPSolver`（避免了 `__init__` 阶段触发 solver 内所有 Layer 0 导入）
+- `emtp/solver.py` 仍是 ~3640 行大单体，计划在后续 PR2–PR7 中拆分为 kernel/runtime/registry
+
+---
+
+## Layer 2: 模块化子包
+
+### devices/ — 分支元件物理实现
+
+每个 Device 实现统一协议：`stamp_G` · `stamp_rhs` · `update_branch_quantities` · `update_history`
+
+| 文件 | 实现 |
+|------|------|
+| `base.py` | `Device` Protocol — 二端元件抽象接口 |
+| `multiport.py` | `MultiPortDevice` Protocol — 多端口元件接口（Bergeron/ULM/UMEC） |
+| `resistor.py` | `ResistorDevice` — 纯电阻，恒定电导，无历史项 |
+| `inductor.py` | `InductorDevice` — 梯形法：`Geq = dt/(2L)`，可选并联阻尼 |
+| `capacitor.py` | `CapacitorDevice` — 梯形法：`Geq = 2C/dt` |
+| `switch.py` | `SwitchDevice` — 定时开/关，Ron/Roff 电导，触发拓扑重建 |
+| `series_rl.py` | `SeriesRLDevice` — 串联 RL，无内部节点的二端实现 |
+| `nonlinear.py` | `NonlinearResistorDevice` — 分段 MOA，`SegmentedSolverHelper` 管理电导切换 |
+| `lpm.py` | `LPMFlashoverDevice` — CIGRE 先导发展法闪络开关 |
+
+### assembly/ — MNA 矩阵装配
+
+| 文件 | 角色 |
+|------|------|
+| `mna.py` | `MNAAssembler` — 构建 (n+m)×(n+m) 增广系统矩阵 G 和 RHS |
+
+### runtime/ — 每步求解编排
+
+| 文件 | 角色 |
+|------|------|
+| `__init__.py` | `DynamicDeviceRuntime` — 开关事件/分支V-I更新/历史推进/非线性重解检查 |
+| `resolve.py` | `ResolveManager` + `ResolveEvent` — 统一的 MOA/LPM/UMEC 重解循环 |
+| `stepper.py` | `TimeStepper` — 主时间步循环，委托每步物理给 solver |
+
+### results/ — 结果存储
+
+| 文件 | 角色 |
+|------|------|
+| `store.py` | `ResultStore` — 预分配缓冲区：时间/节点电压/电压源电流/探针波形 |
+| `__init__.py` | 工具函数：`scale_probe_values`, `node_voltage_from_solution` 等 |
+
+### lines/ — 传输线适配器 + fitULM 解析
+
+| 文件 | 角色 |
+|------|------|
+| `fitulm_resolver.py` | **v0.3.2 新增** — `FitULMSpec` + `FitULMResolver`：外部文件校验 / LCP 自动生成分发 |
+| `bergeron.py` | `BergeronLineDevice` — Bergeron 线 `MultiPortDevice` 适配器 |
+| `ulm.py` | `ULMLineDevice` — ULM 线 `MultiPortDevice` 适配器 |
+
+### transformers/ · sources/ · nonlinear/
+
+| 文件 | 角色 |
+|------|------|
+| `transformers/umec.py` | `UMECTransformerDevice` — UMEC 多端口适配器，饱和驱动矩阵重建 |
+| `sources/__init__.py` | 从 `atp_lightning_current_generator_simplified` try/except 导出 `TWOEXPFCurrentSource`, `HEIDLERFCurrentSource`, `LightningWaveform` |
+| `nonlinear/__init__.py` | 从 `nonlinear_models_pscad` try/except 导出 `SegmentedMOAResistor`, `InsulatorFlashoverLPM` |
+
+---
+
+## Layer 3: 高层管线
+
+### config/ — JSON 工况配置
+
+| 文件 | 角色 |
+|------|------|
+| `schema.py` | `CaseConfig` + `SimulationOptions` dataclass |
+| `loader.py` | `load_case_config()` — 加载/合并默认值/验证 |
+| `validator.py` | `validate_case_config()` — dt/finish_time 正值、有效元件类型、唯一名称 |
+| `defaults.py` | `SUPPORTED_ELEMENTS`, `SUPPORTED_SOURCES`, `SUPPORTED_PROBES`, `DEFAULT_SIMULATION` |
+
+### builders/ — 配置→求解器构建
+
+| 文件 | 角色 |
+|------|------|
+| `solver_builder.py` | `build_solver_from_config()` — 从 CaseConfig 创建并配置 EMTPSolver |
+| `element_builder.py` | `add_element_to_solver()` — 按 `kind` 分发元件到 solver 方法 |
+| `source_builder.py` | `add_source_to_solver()` — 分发电源 |
+| `probe_builder.py` | `add_probe_to_solver()` — 分发探针 |
+
+### snapshot/ — 状态快照
+
+| 文件 | 角色 |
+|------|------|
+| `schema.py` | `SnapshotMetadata` dataclass |
+| `serializer.py` | `save_snapshot()` — 序列化分支/线路/变压器状态到目录 |
+| `restore.py` | `load_snapshot_into_solver()` — 从目录恢复状态 |
+| `hashing.py` | `compute_config_hash()` + `compute_topology_hash()` — SHA-256 |
+
+### export/ — 结果导出
+
+| 文件 | 角色 |
+|------|------|
+| `waveform_exporter.py` | `export_waveforms_npz()` — NPZ + 元数据 JSON + stride 降采样；`read_waveform_chunk()` — 分块读取 |
+| `metrics_exporter.py` | `export_metrics_json()` — 标量指标 → JSON |
+| `csv_exporter.py` | `export_waveforms_csv()` — 1-D 波形 → CSV |
+
+### 根级管线模块
+
+| 文件 | 行数 | 角色 |
+|------|------|------|
+| `emtp/case_runner.py` | 313 | `run_case()` — 全流程入口：加载→构建→模拟→收集→导出→入库 |
+| `emtp/result_bundle.py` | 39 | `ResultBundle` dataclass — 结构化输出容器 |
+| `emtp/result_db.py` | 196 | `ResultDatabase` — SQLite 运行历史 + 指标 + 波形信号 |
+| `emtp/run_id.py` | 13 | `make_run_id()` — 时戳 + UUID 去重 ID |
+
+---
+
+## Layer 4: LCP 线路常数计算
+
+v0.3.2 新增。分两层：`LCP/` 是物理引擎（底层算法），`pylcp/` 是 Python 包装层（面向 EMTP 集成）。
+
+### LCP/ — 线路常数物理引擎 (12 .py)
+
+```
+LCP/
+├── __init__.py                           # 包入口
+├── cable_model.py                        # 电缆 Z/Y (Ametani 1980)
+├── ulm_atp_zy_deri_semlyen.py            # 架空线 Z/Y (Deri-Semlyen)
+├── vectfit3.py                           # Vector Fitting v1.3.1 引擎
+├── vf_core.py                            # VF 适配层 → VectorFitResult
+├── vector_fitting_v411_independent.py    # ULM 完整拟合 v4.11
+└── test/                                 # 案例/验证脚本
+    ├── pscad_reader.py                   # PSCAD 输出文件读取器
+    ├── ulm_ohl_calculation_deri_semlyen.py  # 架空线完整案例
+    ├── ulm_three_core_cable_v2 (1).py    # 三芯管型电缆案例
+    ├── ulm_cable_calculation.py          # 多回铠装电缆案例
+    └── test0304.py                       # 架空线 PSCAD 对比
+```
+
+**模块依赖链**:
+
+```
+vectfit3.py          ← VF 底层引擎，无 LCP 内依赖
+  ↑
+vf_core.py           ← VF 适配层，导入 vectfit3
+  ↑
+vector_fitting_v411_independent.py  ← ULM 完整拟合 + fitULM 读写，导入 vf_core
+```
+
+`cable_model.py` 和 `ulm_atp_zy_deri_semlyen.py` 为 Z/Y 计算引擎，各自独立，无 LCP 内依赖。
+
+**核心 API**（均在 `vector_fitting_v411_independent.py`）:
+
+| 函数 | 用途 |
+|------|------|
+| `ulm_complete_fitting(freq, Z, Y, length, ...)` | Z/Y → VF → ULM 参数 |
+| `write_fitULM(result, filepath, ...)` | 序列化 fitULM 文本文件 |
+| `verify_fitULM_file(filepath)` | 校验 fitULM 文件完整性 |
+| `read_fitULM_header(filepath)` | 读取 fitULM 头部元数据 |
+| `IterativePoleFindingConfig` | VF 配置 dataclass |
+
+### pylcp/ — LCP Python 包装层 (10 .py)
+
+```
+pylcp/
+├── __init__.py              # 统一导出
+├── specs.py                 # LCPLineType 枚举 + LCPFitULMSpec dataclass
+├── exceptions.py            # LCPError / LCPInputError / LCPFittingError / ...
+├── validation.py            # validate_frequency_vector() / validate_zy_matrices()
+├── cache.py                 # compute_cache_key() / get_cache_path()
+├── lcp_fitulm_generator.py  # LCPFitULMGenerator — Z/Y → VF → fitULM 全链路
+└── generation/
+    ├── __init__.py
+    ├── ohl_deri_semlyen.py          # 架空线 Z/Y
+    ├── pipe_type_cable.py           # 管型电缆 Z/Y
+    └── multi_armored_cable.py       # 多回铠装电缆 Z/Y
+```
+
+### ULM 线路接入 — 两条路径
+
+**路径 A：外部 fitULM 文件**（已有文件，直接读取）
+
+```python
+solver.add_ULM_line(
+    name="line1",
+    nodes_send=[1, 2, 3], nodes_recv=[101, 102, 103],
+    length=5000.0,
+    generate_fitulm=False,
+    fitulm_path="models/cable14.fitULM",
+)
+```
+
+**路径 B：LCP 自动生成**（从几何参数生成 fitULM）
+
+```python
+from pylcp import LCPLineType, LCPFitULMSpec
+
+lcp_spec = LCPFitULMSpec(
+    line_type=LCPLineType.OHL_DERI_SEMLYEN,
+    name="ohl_line", length=20000.0,
+    freq=np.logspace(0, 5, 201),
+    geometry_config=line_geometry,
+)
+
+solver.add_ULM_line(
+    name="ohl_line",
+    nodes_send=[1, 2], nodes_recv=[101, 102],
+    length=20000.0,
+    generate_fitulm=True,
+    lcp_spec=lcp_spec,
+)
+```
+
+**内部链路**:
+
+```
+solver.add_ULM_line(...)
+        │
+        ▼
+FitULMResolver.resolve(spec)
+        │
+  ┌─────┴──────┐
+  │ 外部文件      │  LCP 自动生成
+  │ 校验路径/非空  │   │
+  └──────┬──────┘   ▼
+         │    LCPFitULMGenerator.generate()
+         │      ├── compute_zy()     → Z/Y 矩阵
+         │      ├── ulm_complete_fitting() → VF 拟合
+         │      └── write_fitULM()   → fitULM 文件 + verify
+         │
+         ▼
+  solver.add_ulm_line(fitulm_file=path)
+         │
+         ▼
+  FitULMReader → ULMModel → ULMLine → EMTP 时域仿真
+```
+
+---
+
+## 数据流
+
+### run_case() 全链路
 
 ```
 run_case("cases/templates/rc_step.json")
@@ -233,9 +377,10 @@ run_case("cases/templates/rc_step.json")
   │     ├─ add_source_to_solver()   builders/source_builder.py
   │     └─ add_probe_to_solver()    builders/probe_builder.py
   │
-  ├─ 3. solver.run()                solver.py (TimeStepper)
+  ├─ 3. solver.run()                solver.py
   │     ├─ DynamicDeviceRuntime     runtime/__init__.py
   │     ├─ ResolveManager           runtime/resolve.py
+  │     ├─ TimeStepper              runtime/stepper.py
   │     ├─ MNAAssembler             assembly/mna.py
   │     ├─ SparseLinearSolver       sparse_solver.py
   │     └─ ResultStore              results/store.py
@@ -254,34 +399,120 @@ run_case("cases/templates/rc_step.json")
         └─ update_run_done()
 ```
 
----
-
-## 已知技术债（剩余）
-
-PR1 + cleanup 已解决之前记录的全部 9 条技术债。剩余工作进入 PR2–PR7 架构升级计划：
-
-| # | 问题 | 文件 | 计划 PR |
-|---|------|------|---------|
-| 1 | `solver.py` 是 ~3640 行单体文件 | `emtp/solver.py` | PR2–PR7 |
-| 2 | 仿真对象状态分散在 solver 的多个并行容器中 | `emtp/solver.py` | PR2 |
-| 3 | 探针和结果记录逻辑嵌入 solver | `emtp/solver.py` | PR3 |
-| 4 | RHS 构建、电源预采样未独立 | `emtp/solver.py` | PR4 |
-| 5 | G 矩阵装配、LU 缓存与求解逻辑嵌入 solver | `emtp/solver.py` | PR5 |
-| 6 | 非线性重解/开关事件分散在不同设备中 | `emtp/solver.py`, `devices/` | PR6 |
-| 7 | 线路/变压器在 solver 中有特殊处理分支 | `emtp/solver.py` | PR7 |
-
----
-
-## 下一步架构升级 (PR2–PR7)
-
-参见 PR 拆分规划文档（未写入仓库）。核心方向：
+### LCP 自动生成链路
 
 ```
-PR 1 ✅  清理旧 API
-PR 2    建立 SimulationRegistry，统一仿真对象状态
+LCPFitULMSpec (line_type, length, freq, geometry_config, ...)
+  │
+  ▼
+LCPFitULMGenerator.generate()
+  │
+  ├─ 1. validate_frequency_vector()    pylcp/validation.py
+  │
+  ├─ 2. compute_zy()                    pylcp/generation/
+  │     ├─ OHL:      compute_ohl_zy()     → Z/Y via Deri-Semlyen
+  │     ├─ PIPE:     compute_pipe_type_cable_zy() → Z/Y via Ametani
+  │     └─ ARMORED:  compute_multi_armored_cable_zy() → Z/Y
+  │
+  ├─ 3. validate_zy_matrices()          pylcp/validation.py
+  │
+  ├─ 4. ulm_complete_fitting()          LCP/vector_fitting_v411_independent.py
+  │     ├─ compute_ulm_parameters()      Stage 1: ZY → Yc/H/γ/τ/Ti (NR eigensolver)
+  │     └─ perform_ulm_fitting()         Stage 2: VF on tr(Yc) + H modes
+  │
+  └─ 5. write_fitULM() + verify_fitULM_file()
+        ↓
+     .fitULM 文件 → solver.add_ulm_line() 读取
+```
+
+---
+
+## 测试体系
+
+```
+289 passed, 3 skipped
+
+tests/
+├── test_basic_mna.py               # MNA 基本装配
+├── test_trapezoidal_rlc.py         # 梯形法 RLC
+├── test_switches.py                # 开关元件
+├── test_nodes.py                   # 节点管理
+├── test_circuit_model.py           # CircuitModel 容器
+├── test_mna_assembler.py           # MNA 装配器
+├── test_result_store.py            # ResultStore
+├── test_sparse_solver.py           # ... 等
+│
+├── test_p5_basic_physics.py        # RC/RL 物理验证
+├── test_p5_bergeron_reflection.py  # Bergeron 反射
+├── test_p5_ulm_validation.py       # ULM 验证
+├── test_p5_umec_validation.py      # UMEC 验证
+├── test_p5_moa_validation.py       # MOA 验证
+├── test_p5_lpm_validation.py       # LPM 验证
+├── test_p5_tower_validation.py     # 杆塔验证
+│
+├── test_case_config.py             # 配置加载/验证
+├── test_snapshot.py                # 快照保存/恢复
+├── test_export_and_db.py           # 导出 + 数据库
+├── test_product_kernel_loop.py     # run_case → export → db 闭环
+├── test_fixes_min_max_chunk_snapshot.py  # 修复验证
+├── test_solver_regression.py       # 求解器回归 (38 tests)
+│
+├── test_baseline_lcp_emtp.py       # ★ PR-0: LCP 模块可达性 + fitULM API
+├── test_pr1_fitulm_resolver.py     # ★ PR-1: FitULMResolver 外部文件模式
+│
+└── pylcp_tests/                    # ★ PR-2~7: pylcp 集成测试
+    ├── test_pr2_generation.py       # Z/Y 生成 + 校验
+    ├── test_pr3_generator.py        # LCPFitULMGenerator 管线
+    └── test_pr67_integration.py     # 缓存 + E2E 求解器仿真
+```
+
+---
+
+## 版本历程
+
+| 版本 | Commit | 关键变更 |
+|------|--------|---------|
+| v0.1 | `75f307e` | P3/P4/P5 模块化：Device 协议、emtp 包、物理验证 |
+| v0.2.0 | `d439b80` | Solver 迁移：emtp/solver.py canonical、MultiPortDevice、ResolveManager |
+| v0.2.1 | `f42404b` | PR-10~17：ResultStore、Multiport registry、Bergeron/ULM/UMEC adapter |
+| v0.2.2 | `cf8b7dc` | PR-18~19：TimeStepper 主循环、CircuitModel 容器 |
+| v0.3.0 | `6d77ab8` | Case/Config 层、Snapshot/Resume、降采样导出、SQLite |
+| v0.3.1 | `52b87f8` | Bugfix: run_id 字符串路径；PR1: 删除旧 API 垫片 |
+| v0.3.1 | `a487e0f` | Cleanup: 删除死代码/旧测试/空框架 (-10,771 行) |
+| v0.3.2 | `866e210` | **LCP 集成**: fitULM 自动生成, solver.add_ULM_line(), pylcp 包 |
+
+---
+
+## 已知技术债
+
+| # | 问题 | 位置 | 计划 |
+|---|------|------|------|
+| 1 | `solver.py` ~3640 行单体 | `emtp/solver.py` | PR2–PR7 内核重构 |
+| 2 | 仿真对象状态分散在多个并行容器 | `emtp/solver.py` | PR2: SimulationRegistry |
+| 3 | 探针和结果逻辑嵌入 solver | `emtp/solver.py` | PR3: ProbeManager |
+| 4 | RHS 构建/电源预采样未独立 | `emtp/solver.py` | PR4: RHS Engine |
+| 5 | G 装配/LU 缓存嵌入 solver | `emtp/solver.py` | PR5: MNAKernel |
+| 6 | 非线性重解/开关事件分散 | `emtp/solver.py`, `devices/` | PR6: Runtime/Resolve |
+| 7 | 线路/变压器在 solver 中有特殊分支 | `emtp/solver.py` | PR7: MultiPortDevice 接管 |
+| 8 | LCP test/ 中案例脚本仍用旧 import (sys.path 操作) | `LCP/test/` | 迁移到 pylcp 标准 import |
+| 9 | 缺少 ULM element_builder 支持 | `builders/element_builder.py` | 添加 `"ulm_line"` kind |
+
+---
+
+## PR2–PR7 架构升级路线
+
+```
+PR 1 ✅  删除旧 API (emtp_solver_v3.py, emtp_components_series_rl_only.py)
+PR 2    建立 SimulationRegistry，统一对象状态
 PR 3    迁出 ProbeManager / ResultStore
 PR 4    抽出 RHS Engine
-PR 5    抽出 MNAKernel（矩阵装配、缓存、求解）
+PR 5    抽出 MNAKernel（矩阵装配/缓存/求解）
 PR 6    重构 Runtime / Resolve（统一事件与重解）
 PR 7    MultiPortDevice 全量接管线路和变压器
 ```
+
+**架构红线**（后续修改强制遵守）:
+
+1. `solver.py` 不能直接 import Layer 0 物理模型
+2. `solver.py` 不能直接构造 G/RHS
+3. 新增物理模型不能修改 `solver.py`，只能新增 Device/MultiPortDevice adapter 和 builder
