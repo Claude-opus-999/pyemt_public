@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Multiphase ULM lightning verification case for emtp_solver_v3.
+Multiphase ULM lightning verification case for emtp.
 
 This script is adapted from emtp_multiphase_verification.py to work with the
 latest solver architecture uploaded in this conversation.
 
 Main compatibility changes
 --------------------------
-1. Import EMTPSolver from emtp_solver_v3 instead of emtp_solver_v2_time_NAM.
+1. Import EMTPSolver from emtp instead of emtp_solver_v2_time_NAM.
 2. Use the solver's built-in ATP-compatible lightning current source:
    solver.add_standard_twoexpf_IS(...), so the old lightning_waveform module is
    no longer required.
@@ -43,7 +43,7 @@ for _path in (SCRIPT_DIR, PROJECT_DIR, Path.cwd()):
     if _path_str not in sys.path:
         sys.path.insert(0, _path_str)
 
-from emtp_solver_v3 import EMTPSolver  # noqa: E402
+from emtp import EMTPSolver  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

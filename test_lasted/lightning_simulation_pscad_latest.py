@@ -2,11 +2,11 @@
 """
 Lightning surge intrusion simulation with PSCAD-style segmented MOA.
 
-Adapted for emtp_solver_v3.
+Adapted for emtp.
 
 Compatibility changes
 ---------------------
-1. Import EMTPSolver from emtp_solver_v3 instead of emtp_solver_v2_time.
+1. Import EMTPSolver from emtp instead of emtp_solver_v2_time.
 2. Remove old dependencies:
    - emtp_components.CurrentSource
    - lightning_waveform.LightningWaveform / create_lightning_waveform
@@ -66,7 +66,7 @@ for _path in (SCRIPT_DIR, PROJECT_DIR, Path.cwd()):
     if _path_str not in sys.path:
         sys.path.insert(0, _path_str)
 
-from emtp_solver_v3 import EMTPSolver  # noqa: E402
+from emtp import EMTPSolver  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +757,7 @@ Cap Current Peak:
 
 def main() -> LightningSimulationAnalyzer:
     print("=" * 70)
-    print("Lightning intrusion simulation - PSCAD segmented MOA, emtp_solver_v3")
+    print("Lightning intrusion simulation - PSCAD segmented MOA, emtp")
     print("=" * 70)
 
     analyzer = LightningSimulationAnalyzer()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from emtp_solver_v3 import EMTPSolver
+from emtp import EMTPSolver
 
 
 def _max_abs_error(sim, ref):

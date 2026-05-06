@@ -2,11 +2,11 @@
 """
 Three-phase Y-Delta UMEC transformer lightning impulse simulation.
 
-Adapted for emtp_solver_v3.
+Adapted for emtp.
 
 Main compatibility changes
 --------------------------
-1. Import EMTPSolver from emtp_solver_v3 instead of emtp_solver_v2_time.
+1. Import EMTPSolver from emtp instead of emtp_solver_v2_time.
 2. Remove dependency on the old lightning_waveform module.
 3. Use EMTPSolver.add_standard_twoexpf_IS() for the ATP-compatible 2/20 us
    lightning current source.
@@ -49,7 +49,7 @@ for _path in (SCRIPT_DIR, PROJECT_DIR, Path.cwd()):
     if _path_str not in sys.path:
         sys.path.insert(0, _path_str)
 
-from emtp_solver_v3 import EMTPSolver  # noqa: E402
+from emtp import EMTPSolver  # noqa: E402
 from umec_transformer import UMECTransformerData  # noqa: E402
 
 

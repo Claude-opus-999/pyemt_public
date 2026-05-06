@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from emtp.devices.multiport import MultiPortDevice
-from emtp_solver_v3 import EMTPSolver
+from emtp import EMTPSolver
 
 
 class FakeMPDev:

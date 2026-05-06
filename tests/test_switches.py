@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from emtp_solver_v3 import EMTPSolver
+from emtp import EMTPSolver
 
 
 def test_timed_switch_closing_rebuilds_matrix_and_energizes_load():

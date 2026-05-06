@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from transmission_line_emtp_v2 import DelayBuffer, TransmissionLineFactory
-from emtp_solver_v3 import EMTPSolver
+from emtp import EMTPSolver
 
 
 def test_bergeron_factory_parameters_and_delay_buffer():

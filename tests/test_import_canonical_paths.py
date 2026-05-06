@@ -66,8 +66,7 @@ class TestSingleImplementations:
     def test_emtp_solver_from_canonical_source(self):
         from emtp import EMTPSolver as A
         from emtp.solver import EMTPSolver as B
-        from emtp_solver_v3 import EMTPSolver as C
-        assert A is B is C
+        assert A is B
 
     def test_no_runtime_py_file(self):
         """emtp/runtime.py must not exist next to emtp/runtime/ package."""

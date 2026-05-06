@@ -1,24 +1,22 @@
 # API Migration Guide
 
-This guide helps you migrate from the legacy flat-module imports to the new `emtp` package structure introduced in P3/P4.
-
-The legacy imports continue to work — no existing scripts need to change immediately.
+v0.3.1 已完成旧 API 清理。`emtp_solver_v3.py` 和 `emtp_components_series_rl_only.py` 已删除。
 
 ---
 
-## Quick Reference
+## 唯一入口
 
-| Old import | New import |
-|-----------|-----------|
-| `from emtp_solver_v3 import EMTPSolver` | `from emtp import EMTPSolver` |
-| `from emtp_components_series_rl_only import Branch` | `from emtp.types import Branch` |
-| `from emtp_components_series_rl_only import CurrentSource` | `from emtp.types import CurrentSource` |
-| `from emtp_components_series_rl_only import ElementType` | `from emtp.types import ElementType` |
-| `from transmission_line_emtp_v2 import BergeronLine` | `from emtp.lines import BergeronLine` |
-| `from ulm_transmission_line_PARA import ULMLine` | `from emtp.lines import ULMLine` |
-| `from umec_transformer import UMECTransformer` | `from emtp.transformers import UMECTransformer` |
-| `from atp_lightning_current_generator_simplified import ...` | `from emtp.sources import ...` |
-| `from nonlinear_models_pscad import SegmentedMOAResistor` | `from emtp.nonlinear import SegmentedMOAResistor` |
+| 用途 | 导入 |
+|------|------|
+| 求解器 | `from emtp import EMTPSolver` |
+| 高层管线 | `from emtp.case_runner import run_case` |
+| 节点管理 | `from emtp import NodeBook, NodeIndexer` |
+| 类型 | `from emtp.types import Branch, CurrentSource, ElementType, LineData, ...` |
+| Bergeron 线 | `from emtp.lines import BergeronLine` |
+| ULM 线 | `from emtp.lines import ULMLine` |
+| UMEC 变压器 | `from emtp.transformers import UMECTransformer` |
+| 雷电电流源 | `from emtp.sources import ...` |
+| 非线性元件 | `from emtp.nonlinear import SegmentedMOAResistor` |
 
 ---
 
@@ -60,15 +58,15 @@ See [DIRECTION_CONVENTIONS.md](DIRECTION_CONVENTIONS.md) for the full specificat
 
 ---
 
-## Legacy Module Status
+## 模块状态
 
-| Module | Status |
+| 模块 | 状态 |
 |--------|--------|
-| `emtp_solver_v3.py` | Legacy — re-exports from `emtp` package |
-| `emtp_components_series_rl_only.py` | Legacy — re-exports from `emtp.types` |
-| `transmission_line_emtp_v2.py` | Active — Bergeron model (unchanged) |
-| `ulm_transmission_line_PARA.py` | Active — ULM model (unchanged) |
-| `umec_transformer.py` | Active — UMEC model (enhanced with new factories) |
-| `nonlinear_models_pscad.py` | Active — Nonlinear models (unchanged) |
-| `atp_lightning_current_generator_simplified.py` | Active — Lightning sources (unchanged) |
-| `emtp_plotting.py` | Active — Plotting utilities (unchanged) |
+| `emtp_solver_v3.py` | ❌ 已删除（v0.3.1） |
+| `emtp_components_series_rl_only.py` | ❌ 已删除（v0.3.1） |
+| `transmission_line_emtp_v2.py` | ✅ 活跃 — Bergeron 模型 |
+| `ulm_transmission_line_PARA.py` | ✅ 活跃 — ULM 模型 |
+| `umec_transformer.py` | ✅ 活跃 — UMEC 模型 |
+| `nonlinear_models_pscad.py` | ✅ 活跃 — 非线性模型 |
+| `atp_lightning_current_generator_simplified.py` | ✅ 活跃 — 雷电电流源 |
+| `emtp_plotting.py` | ❌ 死代码 — 未被任何文件导入 |

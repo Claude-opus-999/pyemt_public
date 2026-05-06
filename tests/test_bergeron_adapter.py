@@ -122,7 +122,7 @@ class TestBergeronMultiportIntegration:
     produces the same G/RHS as the legacy transmission-line path."""
 
     def test_add_bergeron_registers_multiport_when_enabled(self):
-        from emtp_solver_v3 import EMTPSolver
+        from emtp import EMTPSolver
 
         s = EMTPSolver(dt=1e-6, finish_time=10e-6, verbose=False,
                        use_multiport_lines=True)
@@ -133,7 +133,7 @@ class TestBergeronMultiportIntegration:
         assert mpd.ports == ((1, 0), (2, 0))
 
     def test_no_multiport_when_flag_false(self):
-        from emtp_solver_v3 import EMTPSolver
+        from emtp import EMTPSolver
 
         s = EMTPSolver(dt=1e-6, finish_time=10e-6, verbose=False,
                        use_multiport_lines=False)
@@ -141,7 +141,7 @@ class TestBergeronMultiportIntegration:
         assert len(s._multiport_devices) == 0
 
     def test_solver_runs_with_multiport_enabled(self):
-        from emtp_solver_v3 import EMTPSolver
+        from emtp import EMTPSolver
 
         s = EMTPSolver(dt=1e-6, finish_time=50e-6, verbose=False,
                        use_multiport_lines=False)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from emtp_solver_v3 import EMTPSolver
+from emtp import EMTPSolver
 
 
 class SpyLPM:

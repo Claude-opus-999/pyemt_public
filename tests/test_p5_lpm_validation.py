@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from nonlinear_models_pscad import InsulatorFlashoverLPM, LPMConfig
-from emtp_solver_v3 import EMTPSolver
+from emtp import EMTPSolver
 
 
 @pytest.mark.validation

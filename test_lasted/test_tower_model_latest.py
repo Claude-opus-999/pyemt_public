@@ -80,7 +80,7 @@ from transmission_line_emtp_v2 import (
     DelayBuffer,
 )
 
-from emtp_solver_v3 import EMTPSolver
+from emtp import EMTPSolver
 
 # LPM 先导发展法绝缘子闪络模型
 try:

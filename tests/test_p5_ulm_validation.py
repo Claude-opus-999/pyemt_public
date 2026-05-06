@@ -36,7 +36,7 @@ def test_ulm_different_seeds_different_data():
 @pytest.mark.validation
 @pytest.mark.skipif(not ULM_AVAILABLE, reason="ULM module not available")
 def test_ulm_single_line_finite_outputs():
-    from emtp_solver_v3 import EMTPSolver
+    from emtp import EMTPSolver
     dt, finish = 1e-6, 100e-6
     data = create_test_fitulm_data(nf=1, seed=42)
     model = ULMModel(data, line_length=100e3, dt=dt, verbose=False)

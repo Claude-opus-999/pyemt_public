@@ -6,10 +6,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from emtp_solver_v3 import (
-    EMTPSolver, NodeIndexer, SparseLinearSolver,
-    ValidationReport, ValidationIssue,
-)
+from emtp import EMTPSolver, NodeIndexer
+from emtp.sparse_solver import SparseLinearSolver
+from emtp.types import ValidationReport, ValidationIssue
 
 
 class SolverRegressionTests(unittest.TestCase):

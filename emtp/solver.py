@@ -47,36 +47,11 @@ def _sparse_factorize(A: 'sp.csc_matrix') -> Any:
     return splu(A, permc_spec='MMD_AT_PLUS_A')
 
 try:
-    from emtp_components_rlc import (
-        Branch,
-        CurrentSource,
-        ElementType,
-        LightningWaveform,
-        LineData,
-    )
-except ImportError:
-    try:
-        from emtp_components_series_rl_only_integrated import (
-            Branch,
-            CurrentSource,
-            ElementType,
-            LightningWaveform,
-            LineData,
-        )
-    except ImportError:
-        from emtp_components_series_rl_only import (
-            Branch,
-            CurrentSource,
-            ElementType,
-            LightningWaveform,
-            LineData,
-        )
-
-try:
     from atp_lightning_current_generator_simplified import (
         BaseLightningCurrentSource,
         TWOEXPFCurrentSource,
         HEIDLERFCurrentSource,
+        LightningWaveform,
         create_lightning_current_source,
         create_standard_twoexpf_current_source,
     )
@@ -84,6 +59,7 @@ except ImportError:
     BaseLightningCurrentSource = ()
     TWOEXPFCurrentSource = None
     HEIDLERFCurrentSource = None
+    LightningWaveform = None
     create_lightning_current_source = None
     create_standard_twoexpf_current_source = None
 

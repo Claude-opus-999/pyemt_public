@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from transmission_line_emtp_v2 import TransmissionLineFactory
-from emtp_solver_v3 import EMTPSolver
+from emtp import EMTPSolver
 
 
 @pytest.mark.validation

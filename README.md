@@ -222,17 +222,13 @@ emtp/
 ## 导入约定
 
 ```python
-# 推荐（新代码）
+# 唯一入口
 from emtp import EMTPSolver
-
-# 兼容（旧代码继续工作，返回同一个类）
-from emtp_solver_v3 import EMTPSolver
 
 # Identity 保证
 from emtp import EMTPSolver as A
 from emtp.solver import EMTPSolver as B
-from emtp_solver_v3 import EMTPSolver as C
-assert A is B is C  # True
+assert A is B  # True
 ```
 
 ---

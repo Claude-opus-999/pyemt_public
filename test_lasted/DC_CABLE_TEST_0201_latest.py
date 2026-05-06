@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-DC cable lightning case adapted for emtp_solver_v3.
+DC cable lightning case adapted for emtp.
 
 Compatibility changes from DC_CABLE_TEST_0201.py
 ------------------------------------------------
-1. Import EMTPSolver from emtp_solver_v3 instead of emtp_solver_v2_time_NAM.
+1. Import EMTPSolver from emtp instead of emtp_solver_v2_time_NAM.
 2. Remove the old lightning_waveform dependency and use the solver's
    ATP-compatible current-source API: add_standard_twoexpf_IS().
 3. Resolve the PCH/FitULM file relative to cwd, this script directory, and its
@@ -40,7 +40,7 @@ for _path in (SCRIPT_DIR, PROJECT_DIR, Path.cwd()):
     if _path_str not in sys.path:
         sys.path.insert(0, _path_str)
 
-from emtp_solver_v3 import EMTPSolver  # noqa: E402
+from emtp import EMTPSolver  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

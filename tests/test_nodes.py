@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from emtp_solver_v3 import NodeBook, NodeIndexer
+from emtp import NodeBook, NodeIndexer
 
 
 def test_node_book_ground_aliases_and_string_allocation():

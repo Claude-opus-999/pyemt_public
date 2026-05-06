@@ -228,7 +228,7 @@ class TestSnapshotSafety:
             bad_solver.load_snapshot(tmp_path / "snap", strict=True)
 
     def test_dt_mismatch_rejected(self, tmp_path):
-        from emtp_solver_v3 import EMTPSolver
+        from emtp import EMTPSolver
         config = load_case_config(CASES_DIR / "rc_step.json")
         solver = build_solver_from_config(config)
         solver.run()
