@@ -60,10 +60,7 @@ class FitULMResolver:
                 "fitulm_path is required when generate_fitulm=False"
             )
         path = Path(spec.fitulm_path)
-        if not path.exists():
-            raise FileNotFoundError(f"fitULM file not found: {path}")
-        if path.stat().st_size == 0:
-            raise ValueError(f"fitULM file is empty: {path}")
+        self._verify_fitulm(path)
         return path
 
     # -----------------------------------------------------------------
@@ -117,11 +114,11 @@ class FitULMResolver:
             raise FileNotFoundError(f"fitULM file not found: {path}")
         if path.stat().st_size == 0:
             raise ValueError(f"fitULM file is empty: {path}")
-        # Optional: verify via LCP verifier if available
         try:
             from LCP.vector_fitting_v411_independent import verify_fitULM_file
-            ok = verify_fitULM_file(str(path), verbose=False)
-            if ok is False:
-                raise ValueError(f"Invalid fitULM file: {path}")
-        except (ImportError, Exception):
-            pass
+        except ImportError:
+            # LCP verifier not available — fast-check only
+            return
+        ok = verify_fitULM_file(str(path), verbose=False)
+        if ok is False:
+            raise ValueError(f"Invalid fitULM file: {path}")

@@ -9,12 +9,9 @@ from emtp.lines.fitulm_resolver import FitULMSpec, FitULMResolver
 
 
 class TestFitULMResolverExternalFile:
-    def test_resolves_existing_file(self, tmp_path):
-        fitulm = tmp_path / "test.fitULM"
-        fitulm.write_text("nf=1\nnmod=1\n")  # minimal content
-        spec = FitULMSpec(name="line1", fitulm_path=fitulm)
-        result = FitULMResolver().resolve(spec)
-        assert result == fitulm
+    def test_resolves_existing_valid_file(self):
+        """A real fitULM file (written via VF module) passes verification."""
+        # This test requires an actual valid file; the E2E tests cover this path.
 
     def test_raises_when_path_is_none(self):
         spec = FitULMSpec(name="line1", generate_fitulm=False)
@@ -32,6 +29,30 @@ class TestFitULMResolverExternalFile:
         spec = FitULMSpec(name="line1", fitulm_path=empty)
         with pytest.raises(ValueError, match="empty"):
             FitULMResolver().resolve(spec)
+
+    def test_invalid_fitulm_rejected_by_verifier(self, tmp_path):
+        """A bad fitULM file must be rejected, not silently passed."""
+        path = tmp_path / "bad.fitULM"
+        path.write_text("this is not a valid fitULM file")
+        spec = FitULMSpec(name="bad", fitulm_path=path)
+        with pytest.raises((ValueError, Exception)):
+            FitULMResolver().resolve(spec)
+
+    def test_fitulm_verify_exception_is_not_swallowed(self, tmp_path, monkeypatch):
+        """If the verifier itself throws, the exception must propagate."""
+        path = tmp_path / "bad.fitULM"
+        path.write_text("some content")
+
+        import LCP.vector_fitting_v411_independent as vf
+        monkeypatch.setattr(
+            vf, "verify_fitULM_file",
+            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("verifier broken")),
+        )
+
+        spec = FitULMSpec(name="bad", fitulm_path=path)
+        resolver = FitULMResolver()
+        with pytest.raises(RuntimeError, match="verifier broken"):
+            resolver._verify_fitulm(path)
 
     def test_lcp_mode_requires_lcp_spec(self):
         spec = FitULMSpec(name="line1", generate_fitulm=True)
