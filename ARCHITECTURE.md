@@ -1,6 +1,6 @@
 # PyEMTP 架构文档
 
-版本 `v0.3.3` · 2026-05-06 · **309 passed, 3 skipped**
+版本 `v0.4.0` · 2026-05-06 · **445 passed, 3 skipped**
 
 ---
 
@@ -70,8 +70,8 @@ emtp_v0.2/
 │
 ├── LCP/                                           # Layer 4: 线路常数物理引擎 (12 .py)
 ├── pylcp/                                         # Layer 4: LCP Python 包装层 (10 .py)
-├── emtp/                                          # 主求解器包 (56 .py)
-├── tests/                                         # 测试套件 (43 .py, 309 passed)
+├── emtp/                                          # 主求解器包 (63 .py) ← v0.4.0 新增 registry/probes/rhs/kernel
+├── tests/                                         # 测试套件 (51 .py, 445 passed)
 └── cases/templates/                               # JSON 工况模板 (4 个)
 ```
 
@@ -118,7 +118,7 @@ from emtp.case_runner import run_case
 | 文件 | 行数 | 角色 |
 |------|------|------|
 | `emtp/__init__.py` | 17 | 惰性导出 `EMTPSolver`（`__getattr__`），避免循环导入 |
-| `emtp/solver.py` | ~3660 | **主求解器** — 完整的 MNA 瞬态仿真引擎。是系统最大单体，PLAN: PR2–PR7 拆分。v0.3.3 新增 `add_ULM_line()` 方法支持 LCP 自动生成 |
+| `emtp/solver.py` | ~3670 | **主求解器** — MNA 瞬态仿真引擎 Facade。v0.4.0 新增 5 个子模块委托：`self.registry` / `self.probe_manager` / `self.rhs_engine` / `self.kernel` / `self.event_runtime` |
 | `emtp/types.py` | ~120 | 共享类型 — `ElementType`, `Branch`, `VoltageSource`, `CurrentSource`, `LineData`, `ValidationIssue/Report`, `RHSPlan` |
 | `emtp/nodes.py` | ~80 | `NodeIndexer`（紧凑整数→稀疏矩阵行映射）+ `NodeBook`（命名节点注册） |
 | `emtp/circuit.py` | ~60 | `CircuitModel` dataclass — 独立于求解器的电路拓扑容器 |
@@ -130,7 +130,17 @@ from emtp.case_runner import run_case
 
 - `solver.py` 单向导入 Layer 0 库和 Layer 2 子包模块（v0.3.1 已清理历史遗留的三层 try/except 回退链）
 - `emtp/__init__.py` 惰性导出 `EMTPSolver`（避免了 `__init__` 阶段触发 solver 内所有 Layer 0 导入）
-- `emtp/solver.py` 仍是 ~3660 行大单体，计划在后续 PR2–PR7 中拆分为 kernel/runtime/registry
+- v0.4.0: solver.py 新增 5 个子模块（registry/probes/rhs/kernel/event_runtime），均为 thin wrapper，内部分发到 solver 已有方法；后续可逐步将内部逻辑迁入子模块
+
+### v0.4.0 新增子模块
+
+| 模块 | 文件 | PR | 角色 |
+|------|------|----|------|
+| `emtp/registry/` | `simulation_registry.py`, `records.py` | PR2 | 统一对象注册中心（shadow mode），拓扑/数值版本计数器 |
+| `emtp/probes/` | `probe_manager.py` | PR3 | `ProbeManager` — 探针注册/采样，`ProbeSpec` 不可变描述 |
+| `emtp/rhs/` | `rhs_engine.py` | PR4 | `RHSEngine` — RHS 构建/预采样/RHSPlan 失效 |
+| `emtp/kernel/` | `mna_kernel.py` | PR5 | `MNAKernel` — G 矩阵生命周期/LU 求解/mark_dirty |
+| `emtp/runtime/` | `event_runtime.py` (新增) | PR6 | `EventRuntime` — 每步编排 wrapper（开关/求解/分支更新/历史推进） |
 
 ---
 
@@ -165,6 +175,7 @@ from emtp.case_runner import run_case
 | `__init__.py` | `DynamicDeviceRuntime` — 开关事件/分支V-I更新/历史推进/非线性重解检查 |
 | `resolve.py` | `ResolveManager` + `ResolveEvent` — 统一的 MOA/LPM/UMEC 重解循环 |
 | `stepper.py` | `TimeStepper` — 主时间步循环，委托每步物理给 solver |
+| `event_runtime.py` | **v0.4.0 新增** — `EventRuntime`：每步完整流程 wrapper（开关→求解→分支更新→历史推进） |
 
 ### results/ — 结果存储
 
@@ -207,7 +218,7 @@ from emtp.case_runner import run_case
 | 文件 | 角色 |
 |------|------|
 | `solver_builder.py` | `build_solver_from_config()` — 从 CaseConfig 创建并配置 EMTPSolver |
-| `element_builder.py` | `add_element_to_solver()` — 按 `kind` 分发元件到 solver 方法 |
+| `element_builder.py` | `add_element_to_solver()` — 按 `kind` 分发元件到 solver 方法。v0.4.0 新增 `ulm_line` kind |
 | `source_builder.py` | `add_source_to_solver()` — 分发电源 |
 | `probe_builder.py` | `add_probe_to_solver()` — 分发探针 |
 
@@ -478,7 +489,7 @@ LCPFitULMGenerator.generate()
 ## 测试体系
 
 ```
-309 passed, 3 skipped
+445 passed, 3 skipped
 ```
 
 ```
@@ -487,34 +498,33 @@ tests/
 ├── test_trapezoidal_rlc.py         # 梯形法 RLC
 ├── test_switches.py                # 开关元件
 ├── test_nodes.py                   # 节点管理
-├── test_circuit_model.py           # CircuitModel 容器
-├── test_mna_assembler.py           # MNA 装配器
-├── test_result_store.py            # ResultStore
-├── test_sparse_solver.py           # ... 等
-│
-├── test_p5_basic_physics.py        # RC/RL 物理验证
-├── test_p5_bergeron_reflection.py  # Bergeron 反射
-├── test_p5_ulm_validation.py       # ULM 验证
-├── test_p5_umec_validation.py      # UMEC 验证
-├── test_p5_moa_validation.py       # MOA 验证
-├── test_p5_lpm_validation.py       # LPM 验证
-├── test_p5_tower_validation.py     # 杆塔验证
+│   ...
 │
 ├── test_case_config.py             # 配置加载/验证
 ├── test_snapshot.py                # 快照保存/恢复
 ├── test_export_and_db.py           # 导出 + 数据库
 ├── test_product_kernel_loop.py     # run_case → export → db 闭环
-├── test_fixes_min_max_chunk_snapshot.py  # 修复验证
 ├── test_solver_regression.py       # 求解器回归 (38 tests)
 │
 ├── test_baseline_lcp_emtp.py       # ★ LCP 模块可达性 + fitULM API + 语法检查
 ├── test_pr1_fitulm_resolver.py     # ★ FitULMResolver + add_ULM_line 全接口
 │
-└── pylcp_tests/                    # ★ LCP 集成测试
-    ├── test_pr2_generation.py       # Z/Y 生成 + P_matrix 2D/3D + Y 块对角
-    ├── test_pr3_generator.py        # LCPFitULMGenerator 管线
-    ├── test_cache.py                # 内容 hash 缓存 + 版本字段 + cache_dir 传播
-    └── test_pr67_integration.py     # 缓存复用 + E2E 求解器仿真
+├── pylcp_tests/                    # ★ LCP 集成测试
+│   ├── test_pr2_generation.py       # Z/Y 生成 + P_matrix 2D/3D + Y 块对角
+│   ├── test_pr3_generator.py        # LCPFitULMGenerator 管线
+│   ├── test_cache.py                # 内容 hash 缓存 + 版本字段 + cache_dir 传播
+│   └── test_pr67_integration.py     # 缓存复用 + E2E 求解器仿真
+│
+└── refactor_safety/                # ★ v0.4.0 重构安全网 (136 tests)
+    ├── test_public_api_contract.py  # 74 方法 + 属性存在 + 8 调用模式
+    ├── test_import_boundaries.py    # Layer 隔离 / solver→Layer0 禁止 (xfail)
+    ├── test_waveform_regression.py  # RC/RL/开关/Bergeron 标量不变量
+    ├── test_registry_consistency.py # 双写一致性/版本号/去重
+    ├── test_probe_manager.py        # 注册/索引/采样/向后兼容
+    ├── test_rhs_engine.py           # RHS 构建/预采样等效
+    ├── test_mna_kernel.py           # G 重建/LU 求解/dirty 检测
+    ├── test_event_runtime.py        # 步进编排/开关事件
+    └── test_element_builder_ulm.py  # Builder ulm_line 集成
 ```
 
 ---
@@ -533,35 +543,38 @@ tests/
 | v0.3.2 | `866e210` | **LCP 集成**: fitULM 自动生成, solver.add_ULM_line(), pylcp 包 |
 | v0.3.2 | `200d879`→`56f3d43` | **P0 修复 x6**: 语法检查 / verify 不吞异常 / hash 缓存 / length 一致性 / P_matrix 2D-3D / Y 块对角 |
 | v0.3.3 | `19acfa0`→`735cfdf` | **严格验收 x2**: cache key 版本字段 + cache_dir 传播 / length 默认 None 语义 |
+| v0.4.0 | `8278832`→`07ac052` | **重构 PR0–PR7**: 安全网 (136 tests) + registry/probes/rhs/kernel/event_runtime 子模块 + element_builder ulm_line |
 
 ---
 
-## 已知技术债
+## 已知技术债（v0.4.0 后）
 
-| # | 问题 | 位置 | 计划 |
-|---|------|------|------|
-| 1 | `solver.py` ~3660 行单体 | `emtp/solver.py` | PR2–PR7 内核重构 |
-| 2 | 仿真对象状态分散在多个并行容器 | `emtp/solver.py` | PR2: SimulationRegistry |
-| 3 | 探针和结果逻辑嵌入 solver | `emtp/solver.py` | PR3: ProbeManager |
-| 4 | RHS 构建/电源预采样未独立 | `emtp/solver.py` | PR4: RHS Engine |
-| 5 | G 装配/LU 缓存嵌入 solver | `emtp/solver.py` | PR5: MNAKernel |
-| 6 | 非线性重解/开关事件分散 | `emtp/solver.py`, `devices/` | PR6: Runtime/Resolve |
-| 7 | 线路/变压器在 solver 中有特殊分支 | `emtp/solver.py` | PR7: MultiPortDevice 接管 |
-| 8 | LCP test/ 中案例脚本仍用旧 import (sys.path 操作) | `LCP/test/` | 迁移到 pylcp 标准 import |
-| 9 | 缺少 ULM element_builder 支持 | `builders/element_builder.py` | 添加 `"ulm_line"` kind |
+PR2–PR7 已建立 thin wrapper 层，每个子模块有了自己的家。后续深度重构方向：
+
+| # | 问题 | 状态 |
+|---|------|------|
+| 1 | `SimulationRegistry` 从 shadow mode 升级为唯一真相源 | ✅ 框架已建，双写进行中 |
+| 2 | `ProbeManager` 接管 ResultStore 的探针分配 | ✅ 框架已建，采样逻辑仍在 solver |
+| 3 | `RHSEngine` 内部化 source_sampler / RHSPlan 编译 | ✅ wrapper 已建，内部仍委托 solver |
+| 4 | `MNAKernel` 接管 layout / topology signature / 诊断 | ✅ wrapper 已建，内部仍委托 solver |
+| 5 | `EventRuntime` 三步接口（pre_step / post_solve_check / commit_step） | ✅ wrapper 已建，设备接口待统一 |
+| 6 | `MultiPortDevice` 全量接管线路和变压器 | ✅ element_builder 已支持 ulm_line |
+| 7 | `solver.py` 不再直接 import Layer 0 物理模型 | ⏳ 仍在 solver.py 中（xfail 标记） |
+| 8 | LCP test/ 中案例脚本仍用旧 import | ⏳ 待迁移 |
 
 ---
 
-## PR2–PR7 架构升级路线
+## v0.4.0 重构总结
 
 ```
-PR 1 ✅  删除旧 API (emtp_solver_v3.py, emtp_components_series_rl_only.py)
-PR 2    建立 SimulationRegistry，统一对象状态
-PR 3    迁出 ProbeManager / ResultStore
-PR 4    抽出 RHS Engine
-PR 5    抽出 MNAKernel（矩阵装配/缓存/求解）
-PR 6    重构 Runtime / Resolve（统一事件与重解）
-PR 7    MultiPortDevice 全量接管线路和变压器
+PR 1 ✅ (v0.3.1)  删除旧 API
+PR 0 ✅ (v0.4.0)  重构安全网 — 136 个保护测试
+PR 2 ✅ (v0.4.0)  SimulationRegistry — 统一对象注册 (shadow mode)
+PR 3 ✅ (v0.4.0)  ProbeManager — 探针注册/采样
+PR 4 ✅ (v0.4.0)  RHSEngine — RHS 构建 wrapper
+PR 5 ✅ (v0.4.0)  MNAKernel — G 矩阵/LU 求解 wrapper
+PR 6 ✅ (v0.4.0)  EventRuntime — 每步编排 wrapper
+PR 7 ✅ (v0.4.0)  element_builder ulm_line + SUPPORTED_ELEMENTS
 ```
 
 **架构红线**（后续修改强制遵守）:
