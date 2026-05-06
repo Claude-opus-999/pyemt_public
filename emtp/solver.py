@@ -155,6 +155,7 @@ from emtp.transformers.umec import UMECTransformerDevice
 from emtp.registry import SimulationRegistry, ElementRecord, SourceRecord, MultiPortRecord
 from emtp.probes import ProbeManager
 from emtp.rhs import RHSEngine
+from emtp.kernel import MNAKernel
 from emtp.results import (                                # noqa: E402
     scale_probe_values,
     scale_values,
@@ -360,6 +361,9 @@ class EMTPSolver:
 
         # ---- RHS 引擎 (PR4) ----
         self.rhs_engine = RHSEngine(self)
+
+        # ---- MNA Kernel (PR5) ----
+        self.kernel = MNAKernel(self)
 
         # ---- 轻量探针记录 ----
         # 只记录用户指定的节点/支路波形，避免开启全量 history。
@@ -2208,15 +2212,8 @@ class EMTPSolver:
         return rhs
 
     def _build_system_matrix(self) -> Tuple[sp.csc_matrix, np.ndarray]:
-        """(MNA, rhs) 对:MNA 矩阵按脏位缓存,rhs 每步重建。"""
-        eng = self._stamping
-        if eng.G_dirty or eng.cached_MNA is None:
-            self._build_MNA_matrix()  # side-effect: caches via eng.finish_G
-            self._cached_MNA = eng.cached_MNA
-            self._stats['G_rebuilds'] = self._stats.get('G_rebuilds', 0) + 1
-        else:
-            self._cached_MNA = eng.cached_MNA
-            self._stats['G_cache_hits'] = self._stats.get('G_cache_hits', 0) + 1
+        """(MNA, rhs) 对: G 由 kernel 管理缓存, rhs 每步重建。"""
+        MNA = self.kernel.ensure_matrix()
 
         if self.use_rhs_plan and (self._rhs_plan_dirty or self._rhs_plan is None):
             self._rhs_plan = self._compile_rhs_plan()
@@ -2225,7 +2222,7 @@ class EMTPSolver:
         rhs = (self.rhs_engine.build_fast() if self.use_rhs_plan
                else self.rhs_engine.build())
 
-        return self._cached_MNA, rhs
+        return MNA, rhs
 
     # =========================================================================
     # MNA 稀疏求解 (SuperLU)
@@ -2248,7 +2245,7 @@ class EMTPSolver:
         converged = False
         for seg_iter in range(self._MAX_SEG_ITER):
             MNA, rhs = self._build_system_matrix()
-            V = self._solve_mna(MNA, rhs)
+            V = self.kernel.solve(MNA, rhs)
 
             if not self._seg_node_map:
                 converged = True
