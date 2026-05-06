@@ -152,6 +152,11 @@ from emtp.lines.bergeron import BergeronLineDevice
 from emtp.lines.ulm import ULMLineDevice
 from emtp.lines.fitulm_resolver import FitULMSpec, FitULMResolver
 from emtp.transformers.umec import UMECTransformerDevice
+from emtp.registry import SimulationRegistry, ElementRecord, SourceRecord, MultiPortRecord
+from emtp.probes import ProbeManager
+from emtp.rhs import RHSEngine
+from emtp.kernel import MNAKernel
+from emtp.runtime.event_runtime import EventRuntime
 from emtp.results import (                                # noqa: E402
     scale_probe_values,
     scale_values,
@@ -345,6 +350,24 @@ class EMTPSolver:
         # 允许使用字符串节点名(如 "T1.tower_top"),
         # 内部自动转换为整数节点供 MNA 装配使用。
         self.nodes = NodeBook(start=1)
+
+        # ---- 统一对象注册中心 (PR2: shadow mode) ----
+        self.registry = SimulationRegistry(
+            node_book=self.nodes,
+            node_indexer=self._indexer,
+        )
+
+        # ---- 探针管理 (PR3) ----
+        self.probe_manager = ProbeManager()
+
+        # ---- RHS 引擎 (PR4) ----
+        self.rhs_engine = RHSEngine(self)
+
+        # ---- MNA Kernel (PR5) ----
+        self.kernel = MNAKernel(self)
+
+        # ---- Event Runtime (PR6) ----
+        self.event_runtime = EventRuntime(self)
 
         # ---- 轻量探针记录 ----
         # 只记录用户指定的节点/支路波形，避免开启全量 history。
@@ -576,6 +599,10 @@ class EMTPSolver:
             "node_neg": int(node_neg_id),
         }
         self._invalidate_results()
+        self.probe_manager.add_voltage_probe(
+            name=str(name), node_pos=int(node_pos_id),
+            node_neg=int(node_neg_id),
+        )
 
     def add_branch_current_probe(self, name: str, branch_name: str) -> None:
         """注册普通支路电流探针。"""
@@ -584,6 +611,9 @@ class EMTPSolver:
             "branch_name": str(branch_name),
         }
         self._invalidate_results()
+        self.probe_manager.add_branch_current_probe(
+            name=str(name), branch_name=str(branch_name),
+        )
 
     def _init_probe_storage(self, n_steps: int) -> None:
         """仿真开始前预分配探针结果数组。"""
@@ -728,6 +758,10 @@ class EMTPSolver:
         self._update_node_count(node_from, node_to)
         self._devices.append(dev)
         self.mark_topology_changed(f"add resistor: {name}")
+        self.registry.register_element(ElementRecord(
+            name=name, kind="resistor", nodes=(node_from, node_to),
+            device=dev, metadata={"R": R},
+        ))
 
     def add_L(
         self, name: str,
@@ -764,6 +798,10 @@ class EMTPSolver:
         self._update_node_count(node_from, node_to)
         self._devices.append(dev)
         self.mark_topology_changed(f"add capacitor: {name}")
+        self.registry.register_element(ElementRecord(
+            name=name, kind="capacitor", nodes=(node_from, node_to),
+            device=dev, metadata={"C": C},
+        ))
 
     def add_resistor(
         self,
@@ -831,6 +869,10 @@ class EMTPSolver:
         self._update_node_count(node_from, node_to)
         self._devices.append(dev)
         self.mark_topology_changed(f"add series RL: {name}")
+        self.registry.register_element(ElementRecord(
+            name=name, kind="series_rl", nodes=(node_from, node_to),
+            device=dev, metadata={"R": R, "L": L},
+        ))
 
     def add_SW(
         self, name: str,
@@ -852,6 +894,10 @@ class EMTPSolver:
         self._update_node_count(node_from, node_to)
         self._devices.append(dev)
         self.mark_topology_changed(f"add switch: {name}")
+        self.registry.register_element(ElementRecord(
+            name=name, kind="switch", nodes=(node_from, node_to),
+            device=dev, metadata={"t_close": t_close, "t_open": t_open},
+        ))
 
     def add_switch(
         self,
@@ -888,6 +934,10 @@ class EMTPSolver:
         )
         self._update_node_count(node_from, node_to)
         self.mark_topology_changed(f"add current source: {name}")
+        self.registry.register_source(SourceRecord(
+            name=name, kind="current", nodes=(node_from, node_to),
+            source=current_func,
+        ))
 
     def add_current_source(
         self,
@@ -1114,6 +1164,10 @@ class EMTPSolver:
         self._vs_node_set.add(node_pos)
         self._update_node_count(node_pos, node_neg)
         self.mark_topology_changed(f"add voltage source: {name}")
+        self.registry.register_source(SourceRecord(
+            name=name, kind="voltage", nodes=(node_pos, node_neg),
+            source=source, metadata={"voltage_func": str(voltage_func)},
+        ))
 
         logger.debug("添加电压源 %s: (%d-%d), V(0)=%.2f",
                      name, node_pos, node_neg, source.voltage_at(0.0))
@@ -1665,6 +1719,15 @@ class EMTPSolver:
         else:
             self._lines_compiled = False
         self.transmission_lines[line.name] = line
+        if hasattr(line, 'nodes_k') and hasattr(line, 'nodes_m'):
+            nodes_k = getattr(line, 'nodes_k', [])
+            nodes_m = getattr(line, 'nodes_m', [])
+            all_terminals = tuple(list(nodes_k) + list(nodes_m))
+            kind = "bergeron" if "Bergeron" in type(line).__name__ else "ulm" if "ULM" in type(line).__name__ else "line"
+            self.registry.register_multiport(MultiPortRecord(
+                name=line.name, kind=kind, terminals=all_terminals,
+                device=line,
+            ))
 
         nodes_k, nodes_m = self._get_line_nodes(line)
         self._update_node_count(nodes_k, nodes_m)
@@ -2153,24 +2216,17 @@ class EMTPSolver:
         return rhs
 
     def _build_system_matrix(self) -> Tuple[sp.csc_matrix, np.ndarray]:
-        """(MNA, rhs) 对:MNA 矩阵按脏位缓存,rhs 每步重建。"""
-        eng = self._stamping
-        if eng.G_dirty or eng.cached_MNA is None:
-            self._build_MNA_matrix()  # side-effect: caches via eng.finish_G
-            self._cached_MNA = eng.cached_MNA
-            self._stats['G_rebuilds'] = self._stats.get('G_rebuilds', 0) + 1
-        else:
-            self._cached_MNA = eng.cached_MNA
-            self._stats['G_cache_hits'] = self._stats.get('G_cache_hits', 0) + 1
+        """(MNA, rhs) 对: G 由 kernel 管理缓存, rhs 每步重建。"""
+        MNA = self.kernel.ensure_matrix()
 
         if self.use_rhs_plan and (self._rhs_plan_dirty or self._rhs_plan is None):
             self._rhs_plan = self._compile_rhs_plan()
             self._rhs_plan_dirty = False
 
-        rhs = (self._build_rhs_fast() if self.use_rhs_plan
-               else self._build_MNA_rhs())
+        rhs = (self.rhs_engine.build_fast() if self.use_rhs_plan
+               else self.rhs_engine.build())
 
-        return self._cached_MNA, rhs
+        return MNA, rhs
 
     # =========================================================================
     # MNA 稀疏求解 (SuperLU)
@@ -2193,7 +2249,7 @@ class EMTPSolver:
         converged = False
         for seg_iter in range(self._MAX_SEG_ITER):
             MNA, rhs = self._build_system_matrix()
-            V = self._solve_mna(MNA, rhs)
+            V = self.kernel.solve(MNA, rhs)
 
             if not self._seg_node_map:
                 converged = True

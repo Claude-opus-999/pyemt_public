@@ -68,6 +68,23 @@ def add_element_to_solver(solver, element: dict) -> None:
         )
         return
 
+    if kind == "ulm_line":
+        solver.add_ULM_line(
+            name=element["name"],
+            nodes_send=element["nodes_send"],
+            nodes_recv=element["nodes_recv"],
+            length=float(
+                element["length"] if "length" in element
+                else _resolve_lcp_length(element)
+            ),
+            generate_fitulm=bool(element.get("generate_fitulm", False)),
+            fitulm_path=element.get("fitulm_path", None),
+            lcp_spec=element.get("lcp_spec", None),
+            cache_dir=element.get("cache_dir", ".lcp_cache"),
+            force_recompute=bool(element.get("force_recompute", False)),
+        )
+        return
+
     if kind == "lpm_insulator":
         solver.add_insulator_LPM(
             element["name"],
@@ -89,6 +106,17 @@ def add_element_to_solver(solver, element: dict) -> None:
         return
 
     raise ValueError(f"Unsupported element kind: {kind!r}")
+
+
+def _resolve_lcp_length(element: dict) -> float:
+    """When lcp_spec is provided, length defaults to lcp_spec.length."""
+    lcp_spec = element.get("lcp_spec")
+    if lcp_spec is not None:
+        return float(lcp_spec.length)
+    raise ValueError(
+        f"ulm_line {element.get('name')!r} requires 'length' "
+        "or 'lcp_spec' with a length attribute"
+    )
 
 
 def _resolve_bergeron_tau(element: dict) -> float:
