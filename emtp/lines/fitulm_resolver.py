@@ -105,9 +105,10 @@ class FitULMResolver:
     def _get_output_path(self, lcp_spec, fitulm_spec: FitULMSpec) -> Path:
         if getattr(lcp_spec, 'output_path', None) is not None:
             return Path(lcp_spec.output_path)
-        # Auto-generate from cache_dir + name
-        fitulm_spec.cache_dir.mkdir(parents=True, exist_ok=True)
-        return fitulm_spec.cache_dir / f"{fitulm_spec.name}.fitULM"
+        from pylcp.cache import get_cache_path
+        if not getattr(lcp_spec, 'cache_dir', None):
+            lcp_spec.cache_dir = Path(fitulm_spec.cache_dir)
+        return get_cache_path(lcp_spec)
 
     def _verify_fitulm(self, path: Path) -> None:
         if not path.exists():

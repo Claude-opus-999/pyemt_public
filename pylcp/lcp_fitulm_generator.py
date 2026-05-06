@@ -105,10 +105,11 @@ class LCPFitULMGenerator:
         from LCP.vector_fitting_v411_independent import (
             write_fitULM, verify_fitULM_file,
         )
+        from .cache import get_cache_path
 
         output_path = (
             Path(spec.output_path) if spec.output_path
-            else Path(spec.cache_dir) / f"{spec.name}.fitULM"
+            else get_cache_path(spec)
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
 

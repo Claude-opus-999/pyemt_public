@@ -59,13 +59,35 @@ class TestCacheKeys:
         assert path.name.endswith(".fitULM")
 
 
+def _write_minimal_valid_fitulm(path):
+    """Write a real valid fitULM file that passes verify_fitULM_file."""
+    import numpy as np
+    from LCP.vector_fitting_v411_independent import write_fitULM, ULMFittingResult
+
+    class MinimalHModeFit:
+        poles = np.array([-1e6 + 0j])
+        c_matrix_residues = np.array([[[1.0 + 0j]]])
+        tau = 1e-6
+
+    result = ULMFittingResult(
+        nf=1, n_active_modes=1, active_modes=[], mode_groups=[[0]],
+        poles_Yc=np.array([-1e5 + 0j]),
+        k_residues=np.array([[[1.0 + 0j]]]),
+        k0=np.array([[0.0]]),
+        tau_all=np.array([1e-6]),
+        D_matrices=None, H_modes_fits=[MinimalHModeFit()],
+        Yc_trace_rmse=0.001, H_modes_rmse=[0.001], H_matrix_rmse=0.001,
+        is_passive=True, is_freq_dependent=False,
+        H_reconstruction_metrics=None, H_reconstructed=None,
+    )
+    write_fitULM(result, str(path), precision=16, verbose=False)
+
+
 class TestResolverCacheReuse:
     def test_cache_reuse_skips_generation(self, tmp_path, monkeypatch):
         """When a cached file exists and force_recompute=False, skip generation."""
-        from emtp.lines import fitulm_resolver as resolver_module
-
         cached_file = tmp_path / "cached.fitULM"
-        cached_file.write_text("nf=1\n")
+        _write_minimal_valid_fitulm(cached_file)
 
         class FakeSpec:
             line_type = LCPLineType.OHL_DERI_SEMLYEN
@@ -94,7 +116,7 @@ class TestResolverCacheReuse:
     def test_force_recompute_regenerates(self, tmp_path, monkeypatch):
         """force_recompute=True regenerates even if cache exists."""
         cached_file = tmp_path / "cached.fitULM"
-        cached_file.write_text("nf=1\n")
+        _write_minimal_valid_fitulm(cached_file)
 
         class FakeSpec:
             line_type = LCPLineType.OHL_DERI_SEMLYEN
