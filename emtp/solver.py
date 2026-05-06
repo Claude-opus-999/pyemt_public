@@ -150,6 +150,7 @@ from emtp.runtime.stepper import TimeStepper
 from emtp.results.store import ResultStore
 from emtp.lines.bergeron import BergeronLineDevice
 from emtp.lines.ulm import ULMLineDevice
+from emtp.lines.fitulm_resolver import FitULMSpec, FitULMResolver
 from emtp.transformers.umec import UMECTransformerDevice
 from emtp.results import (                                # noqa: E402
     scale_probe_values,
@@ -1694,6 +1695,68 @@ class EMTPSolver:
                 BergeronLineDevice(name, line, node_k, node_m)
             )
         return line
+
+    def add_ULM_line(
+        self,
+        name: str,
+        nodes_send: Union[int, List[int]],
+        nodes_recv: Union[int, List[int]],
+        *,
+        length: float = 1.0,
+        generate_fitulm: bool = False,
+        fitulm_path=None,
+        lcp_spec=None,
+        cache_dir=".lcp_cache",
+        force_recompute: bool = False,
+    ) -> 'ULMLine':
+        """Add a ULM transmission line with optional auto-generation.
+
+        Parameters
+        ----------
+        name:
+            Unique line name.
+        nodes_send:
+            Sending-end node(s).  Single int for single-phase, list for
+            multi-phase (length must match the fitULM conductor count).
+        nodes_recv:
+            Receiving-end node(s).  Same rules as *nodes_send*.
+        length:
+            Line length in metres.
+        generate_fitulm:
+            When False (default), read from an existing *fitulm_path*.
+            When True, generate a fitULM file via LCP from *lcp_spec*.
+        fitulm_path:
+            Path to an existing fitULM file.  Required when
+            *generate_fitulm* is False.
+        lcp_spec:
+            :class:`~pylcp.LCPFitULMSpec` for automatic generation.
+            Required when *generate_fitulm* is True.
+        cache_dir:
+            Directory for auto-generated fitULM cache files.
+        force_recompute:
+            When True, re-run LCP generation even if cached.
+
+        Returns
+        -------
+        ULMLine
+        """
+        spec = FitULMSpec(
+            name=name,
+            generate_fitulm=generate_fitulm,
+            fitulm_path=Path(fitulm_path) if fitulm_path else None,
+            lcp_spec=lcp_spec,
+            cache_dir=Path(cache_dir),
+            force_recompute=force_recompute,
+        )
+        resolver = FitULMResolver()
+        resolved_path = resolver.resolve(spec)
+        return self.add_ulm_line(
+            name=name,
+            nodes_k=nodes_send,
+            nodes_m=nodes_recv,
+            fitulm_file=str(resolved_path),
+            length=length,
+        )
 
     def add_ulm_line(
         self, name: str,
