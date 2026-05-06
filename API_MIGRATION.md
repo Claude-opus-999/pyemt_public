@@ -69,4 +69,4 @@ See [DIRECTION_CONVENTIONS.md](DIRECTION_CONVENTIONS.md) for the full specificat
 | `umec_transformer.py` | ✅ 活跃 — UMEC 模型 |
 | `nonlinear_models_pscad.py` | ✅ 活跃 — 非线性模型 |
 | `atp_lightning_current_generator_simplified.py` | ✅ 活跃 — 雷电电流源 |
-| `emtp_plotting.py` | ❌ 死代码 — 未被任何文件导入 |
+| `emtp_plotting.py` | ❌ 已删除 — 死代码，无引用 |

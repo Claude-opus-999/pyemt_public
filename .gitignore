@@ -1,8 +1,10 @@
 ﻿.idea/
 __pycache__/
 *.py[cod]
+*.png
 .venv/
 venv/
 env/
 .env
 .DS_Store
+.claude/
