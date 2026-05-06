@@ -106,8 +106,8 @@ class FitULMResolver:
         if getattr(lcp_spec, 'output_path', None) is not None:
             return Path(lcp_spec.output_path)
         from pylcp.cache import get_cache_path
-        if not getattr(lcp_spec, 'cache_dir', None):
-            lcp_spec.cache_dir = Path(fitulm_spec.cache_dir)
+        # Outer FitULMSpec.cache_dir is the authoritative cache directory
+        lcp_spec.cache_dir = Path(fitulm_spec.cache_dir)
         return get_cache_path(lcp_spec)
 
     def _verify_fitulm(self, path: Path) -> None:
