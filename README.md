@@ -2,7 +2,7 @@
 
 基于 Python 的电磁暂态（EMTP）仿真求解器。使用修正节点分析法（MNA）进行电路求解，集成多相传输线、非线性元件、UMEC 变压器和绝缘子闪络模型。
 
-**当前版本**: `v0.3.1` (commit `52b87f8`) · **测试**: 248 passed, 3 skipped · **Python**: 3.12+ · **依赖**: numpy, scipy
+**当前版本**: `v0.4.0` · **测试**: 445 passed, 3 skipped · **Python**: 3.12+ · **依赖**: numpy, scipy
 
 ---
 
@@ -122,7 +122,8 @@ db.list_recent_runs(10)
 | | 雷电电流源 | `add_lightning_IS(...)` |
 | | 双指数源 | `add_standard_double_exponential_current_source(...)` |
 | 线路 | Bergeron | `add_bergeron_line(name, nk, nm, Zc, tau)` |
-| | ULM | `add_ulm_line(name, nk, nm, fitulm_file, length)` |
+| | ULM (外部文件) | `add_ULM_line(name, nodes_send, nodes_recv, length, fitulm_path=...)` |
+| | ULM (LCP自动生成) | `add_ULM_line(name, nodes_send, nodes_recv, generate_fitulm=True, lcp_spec=...)` |
 | 变压器 | UMEC | `add_UMEC_transformer(name, data)` |
 | 非线性 | MOA 避雷器 | `add_MOA_from_file(name, nf, nt, file)` |
 | | LPM 闪络 | `add_insulator_LPM(name, nf, nt, gap_length)` |
@@ -133,32 +134,21 @@ db.list_recent_runs(10)
 
 ```
 emtp/
-├── solver.py               EMTPSolver 门面 (3525 行)
+├── solver.py               EMTPSolver Facade (~3670 行)
 ├── circuit.py              CircuitModel 数据容器
 │
-├── config/                 Case/Config 层 (NEW v0.3)
-│   ├── schema.py           CaseConfig / SimulationOptions
-│   ├── loader.py           load_case_config()
-│   └── validator.py        validate_case_config()
+├── config/                 Case/Config 层 (v0.3)
+├── builders/               配置→求解器构建器 (v0.3)
+├── snapshot/               状态快照 (v0.3)
+├── export/                 结果导出 (v0.3)
+├── case_runner.py          run_case() 高层入口 (v0.3)
+├── result_bundle.py        ResultBundle 输出容器 (v0.3)
+├── result_db.py            SQLite 运行历史 (v0.3)
 │
-├── builders/               配置→求解器构建器 (NEW v0.3)
-│   ├── solver_builder.py   build_solver_from_config()
-│   ├── element_builder.py  resistor/inductor/capacitor/line/...
-│   ├── source_builder.py   current/voltage/lightning
-│   └── probe_builder.py    voltage/branch_current
-│
-├── case_runner.py          run_case() 高层入口 (NEW v0.3)
-├── result_bundle.py        ResultBundle 输出容器 (NEW v0.3)
-├── result_db.py            SQLite 运行历史数据库 (NEW v0.3)
-│
-├── snapshot/               状态保存/恢复 (NEW v0.3)
-│   ├── serializer.py       save_snapshot()
-│   ├── restore.py          load_snapshot_into_solver()
-│   └── hashing.py          topology/config hash
-│
-├── export/                 结果导出 (NEW v0.3)
-│   ├── waveform_exporter.py  NPZ 导出 + 降采样 + 分块读取
-│   └── metrics_exporter.py   JSON 指标导出
+├── registry/               ★ v0.4.0 — SimulationRegistry 统一对象注册
+├── probes/                 ★ v0.4.0 — ProbeManager 探针管理
+├── rhs/                    ★ v0.4.0 — RHSEngine RHS 构建
+├── kernel/                 ★ v0.4.0 — MNAKernel G 矩阵/LU 求解
 │
 ├── nodes.py                NodeIndexer / NodeBook
 ├── types.py                Branch / VoltageSource / ElementType / ...
@@ -167,34 +157,16 @@ emtp/
 ├── validation.py           电路校验
 │
 ├── runtime/
-│   ├── __init__.py         DynamicDeviceRuntime — 每步状态管理
-│   ├── resolve.py          ResolveManager + ResolveEvent — 重解循环
-│   └── stepper.py          TimeStepper — 主循环
+│   ├── __init__.py         DynamicDeviceRuntime
+│   ├── resolve.py          ResolveManager + ResolveEvent
+│   ├── stepper.py          TimeStepper
+│   └── event_runtime.py    ★ v0.4.0 — EventRuntime 每步编排
 │
 ├── results/
-│   ├── __init__.py         结果 helper 函数 (scale, node_voltage, ...)
-│   └── store.py            ResultStore — 预分配缓冲区
-│
 ├── assembly/
-│   └── mna.py              MNAAssembler — G/RHS 装配骨架
-│
-├── devices/
-│   ├── base.py             Device Protocol (二端元件)
-│   ├── multiport.py        MultiPortDevice Protocol (多端口)
-│   ├── resistor.py         ResistorDevice
-│   ├── inductor.py         InductorDevice
-│   ├── capacitor.py        CapacitorDevice
-│   ├── switch.py           SwitchDevice
-│   ├── series_rl.py        SeriesRLDevice
-│   ├── nonlinear.py        NonlinearResistorDevice (MOA)
-│   └── lpm.py              LPMFlashoverDevice
-│
-├── lines/
-│   ├── bergeron.py         BergeronLineDevice adapter
-│   └── ulm.py              ULMLineDevice adapter
-│
-└── transformers/
-    └── umec.py             UMECTransformerDevice adapter
+├── devices/                (resistor/inductor/capacitor/switch/series_rl/nonlinear/lpm)
+├── lines/                  (fitulm_resolver ★ v0.3.2 / bergeron / ulm)
+└── transformers/           (umec)
 ```
 
 ---
@@ -264,7 +236,7 @@ solver = EMTPSolver(
 
 ```bash
 pytest tests/ -q --ignore=tests/test_tower_case_p1.py
-# 248 passed, 3 skipped
+# 445 passed, 3 skipped
 ```
 
 | 分类 | 测试文件 | 覆盖 |
@@ -313,7 +285,10 @@ emtp/solver.py
 | v0.2.1 | `f42404b` | PR-10~17：ResultStore 接入、Multiport registry、Bergeron/ULM/UMEC adapter 注册、ResolveEvent、MNAAssembler (154 tests) |
 | v0.2.2 | `cf8b7dc` | PR-18~19：TimeStepper 主循环、CircuitModel 容器 (159 tests) |
 | v0.3.0 | `6d77ab8` | Case/Config 层、Snapshot/Resume、结果降采样导出、SQLite 数据库 (205 tests) |
-| v0.3.1 | `52b87f8` | Bugfix: run_id 字符串路径生成；补测：DB min/max、2D chunk、Bergeron state_dict、resume 等价 (248 tests) |
+| v0.3.1 | `52b87f8` | Bugfix: run_id 字符串路径生成；补测 (248 tests) |
+| v0.3.2 | `866e210` | **LCP 集成**: fitULM 自动生成, solver.add_ULM_line(), pylcp 包 (289 tests) |
+| v0.3.3 | `735cfdf` | **P0 修复 ×8**: verify/缓存/length/P_matrix/Y块对角 等 (309 tests) |
+| v0.4.0 | `d05a9eb` | **PR0–PR7 重构**: registry/probes/rhs/kernel/event_runtime + 安全网 136 tests (445 tests) |
 
 ---
 
@@ -321,4 +296,4 @@ emtp/solver.py
 
 - [API Migration Guide](API_MIGRATION.md) — 旧→新导入路径
 - [Direction Conventions](DIRECTION_CONVENTIONS.md) — 符号、单位和 stamping 约定
-- [Solver Architecture](EMTP_SOLVER_ARCHITECTURE.md) — 详细内部设计
+- [Architecture](ARCHITECTURE.md) — 详细架构文档
